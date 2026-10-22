@@ -30,3 +30,10 @@
 * Subscribed to Redis *before* fetching the database snapshot to prevent race conditions where events are dropped between the read and the socket connection.
 * Secured the WebSocket by requiring the JWT in the first incoming payload message, preventing token leakage in HTTP access logs.
 
+## [Today's Date] PR 6: Frontend Canvas & SSR Authentication
+**What we built:** Initialized the Next.js App Router frontend, secured routes using Supabase SSR middleware, and built the interactive React Flow canvas.
+**Key architectural decisions:** 
+* Enforced server-side JWT claim validation in `src/proxy.ts` (Next 16) rather than trusting client-side cookies.
+* Implemented client-side DAG validation rules (no cycles, no self-loops) inside the React Flow `onConnect` handler to prevent bad edge creation before API submission.
+* Rendered the canvas strictly on the client to prevent SSR hydration mismatches with the dark mode theme.
+
