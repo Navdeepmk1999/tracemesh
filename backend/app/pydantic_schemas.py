@@ -35,7 +35,8 @@ class WorkflowRead(ORMModel):
 
 
 class NodeCreate(BaseModel):
-    workflow_id: uuid.UUID
+    # workflow_id comes from the URL path, never the body, so a client can't
+    # attach a node to a workflow it doesn't own.
     node_type: str = Field(min_length=1, max_length=100)
     config_json: dict[str, Any] = Field(default_factory=dict)
 
@@ -55,9 +56,10 @@ class NodeRead(ORMModel):
 # --- Executions --------------------------------------------------------------
 
 
-class ExecutionCreate(BaseModel):
-    # Status starts as PENDING; the orchestrator owns all later transitions.
-    workflow_id: uuid.UUID
+class ExecutionQueued(BaseModel):
+    # Status starts as PENDING; the worker owns all later transitions.
+    execution_id: uuid.UUID
+    status: ExecutionStatus
 
 
 class ExecutionRead(ORMModel):

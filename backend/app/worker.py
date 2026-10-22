@@ -4,47 +4,134 @@ Run from backend/:  tracemesh-env/bin/python -m app.worker
 
 Delivery is at-least-once: a message is acked only after processing finishes,
 so if the worker dies mid-task the broker redelivers it to another consumer.
+The executions row, not the message, is the source of truth for whether work
+still needs doing, which makes redeliveries safe.
 """
 
 import asyncio
 import json
 import signal
+import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import aio_pika
 from aio_pika.abc import AbstractIncomingMessage
+from sqlalchemy import update
 
 from app.broker import TASK_QUEUE, declare_task_queues
 from app.config import get_settings
+from app.database import SessionLocal, engine
+from app.models import Execution, ExecutionStatus
 
-SIMULATED_WORK_SECONDS = 2
+SIMULATED_SECONDS_PER_NODE = 1
+
+# A RUNNING row on delivery means a previous worker died before acking (the
+# broker gives a message to one consumer at a time), so it is safe to re-run.
+CLAIMABLE = (ExecutionStatus.PENDING, ExecutionStatus.RUNNING)
 
 
 def log(text: str) -> None:
     print(f"[worker {datetime.now(timezone.utc):%H:%M:%S}] {text}", flush=True)
 
 
+class MalformedTask(ValueError):
+    pass
+
+
+def parse_task(body: bytes) -> tuple[uuid.UUID, list[dict[str, Any]], list[str]]:
+    try:
+        payload = json.loads(body)
+        execution_id = uuid.UUID(payload["execution_id"])
+        nodes = {n["id"]: n for n in payload["nodes"]}
+        order = [str(i) for i in payload["order"]]
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise MalformedTask(f"{type(exc).__name__}: {exc}") from None
+    if set(order) != set(nodes):
+        raise MalformedTask("order does not match nodes")
+    return execution_id, [nodes[i] for i in order], order
+
+
+async def set_status(
+    execution_id: uuid.UUID,
+    new_status: ExecutionStatus,
+    *,
+    only_from: tuple[ExecutionStatus, ...],
+    **values: Any,
+) -> bool:
+    """Conditionally move an execution to new_status; True if a row changed.
+
+    The WHERE on the current status makes each transition atomic, so a
+    duplicate delivery can never overwrite a finished execution. Each call is
+    its own short transaction, which Supavisor's transaction mode needs.
+    """
+    async with SessionLocal() as session, session.begin():
+        result = await session.execute(
+            update(Execution)
+            .where(Execution.id == execution_id, Execution.status.in_(only_from))
+            .values(status=new_status, **values)
+            .returning(Execution.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+
+async def run_execution(execution_id: uuid.UUID, nodes: list[dict[str, Any]]) -> None:
+    for i, node in enumerate(nodes, start=1):
+        log(f"  {execution_id} node {i}/{len(nodes)} {node['node_type']} ({node['id']})")
+        await asyncio.sleep(SIMULATED_SECONDS_PER_NODE)
+
+
 async def handle_message(message: AbstractIncomingMessage) -> None:
     try:
-        payload = json.loads(message.body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        execution_id, nodes, _ = parse_task(message.body)
+    except MalformedTask as exc:
         # Retrying can't fix a malformed body: dead-letter it immediately.
-        log(f"rejected {message.message_id}: body is not valid JSON")
+        log(f"rejected {message.message_id}: {exc}")
         await message.reject(requeue=False)
         return
 
     try:
-        log(f"processing {message.message_id} (redelivered={message.redelivered})")
-        await asyncio.sleep(SIMULATED_WORK_SECONDS)
-        result = {"message_id": message.message_id, "status": "COMPLETED", "payload": payload}
+        claimed = await set_status(
+            execution_id,
+            ExecutionStatus.RUNNING,
+            only_from=CLAIMABLE,
+            started_at=datetime.now(timezone.utc),
+            completed_at=None,
+        )
+        if not claimed:
+            # Already COMPLETED/FAILED (duplicate delivery), or the workflow
+            # was deleted. Either way there is nothing left to do.
+            log(f"skipped {execution_id}: already finished or no longer exists")
+            await message.ack()
+            return
+
+        log(f"running {execution_id}: {len(nodes)} node(s) (redelivered={message.redelivered})")
+        try:
+            await run_execution(execution_id, nodes)
+        except Exception as exc:
+            log(f"failed {execution_id}: {exc!r}")
+            await set_status(
+                execution_id,
+                ExecutionStatus.FAILED,
+                only_from=(ExecutionStatus.RUNNING,),
+                completed_at=datetime.now(timezone.utc),
+            )
+        else:
+            await set_status(
+                execution_id,
+                ExecutionStatus.COMPLETED,
+                only_from=(ExecutionStatus.RUNNING,),
+                completed_at=datetime.now(timezone.utc),
+            )
+            log(f"completed {execution_id}")
     except Exception as exc:
-        # Retry once on a fresh delivery; a second failure goes to the DLQ.
-        log(f"failed {message.message_id}: {exc!r}")
+        # Infrastructure failure (e.g. the database is unreachable): the status
+        # could not be recorded. Retry once on a fresh delivery, then dead-letter.
+        log(f"error on {execution_id}: {exc!r}")
         await message.nack(requeue=not message.redelivered)
         return
 
     await message.ack()
-    log(f"acked {json.dumps(result)}")
 
 
 async def main() -> None:
@@ -67,23 +154,26 @@ async def main() -> None:
             in_flight.discard(task)
 
     connection = await aio_pika.connect_robust(settings.rabbitmq_url)
-    async with connection:
-        channel = await connection.channel()
-        # Without a prefetch limit the broker pushes the whole backlog to the
-        # first worker that connects; this caps it so work spreads evenly.
-        await channel.set_qos(prefetch_count=settings.worker_prefetch_count)
-        queue = await declare_task_queues(channel)
+    try:
+        async with connection:
+            channel = await connection.channel()
+            # Without a prefetch limit the broker pushes the whole backlog to the
+            # first worker that connects; this caps it so work spreads evenly.
+            await channel.set_qos(prefetch_count=settings.worker_prefetch_count)
+            queue = await declare_task_queues(channel)
 
-        consumer_tag = await queue.consume(on_message)
-        log(f"consuming from {TASK_QUEUE!r} (prefetch={settings.worker_prefetch_count}); Ctrl+C to stop")
+            consumer_tag = await queue.consume(on_message)
+            log(f"consuming from {TASK_QUEUE!r} (prefetch={settings.worker_prefetch_count}); Ctrl+C to stop")
 
-        await stop.wait()
+            await stop.wait()
 
-        # Stop receiving new messages, then let in-flight ones finish and ack.
-        log("shutting down: draining in-flight messages")
-        await queue.cancel(consumer_tag)
-        if in_flight:
-            await asyncio.gather(*in_flight, return_exceptions=True)
+            # Stop receiving new messages, then let in-flight ones finish and ack.
+            log("shutting down: draining in-flight messages")
+            await queue.cancel(consumer_tag)
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
+    finally:
+        await engine.dispose()
     log("stopped")
 
 
