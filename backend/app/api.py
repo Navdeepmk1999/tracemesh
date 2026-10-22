@@ -19,7 +19,7 @@ from app.auth import CurrentUser
 from app.broker import publish_task
 from app.dag import InvalidDAGError, build_dag_payload, topological_order
 from app.database import get_db
-from app.models import Edge, Execution, ExecutionStatus, Node, Workflow
+from app.models import Edge, Execution, ExecutionStatus, Node, NodeRun, Workflow
 from app.pydantic_schemas import (
     EdgeCreate,
     EdgeRead,
@@ -318,6 +318,9 @@ async def execute_workflow(workflow_id: uuid.UUID, user_id: CurrentUser, db: DB)
     # Commit before publishing: the worker must be able to find the row as
     # soon as it receives the message.
     db.add(execution)
+    # One PENDING row per node, committed atomically with the execution, so
+    # hydration always has a complete picture of the run.
+    db.add_all(NodeRun(execution_id=execution.id, node_id=n.id) for n in nodes)
     await db.commit()
 
     try:
