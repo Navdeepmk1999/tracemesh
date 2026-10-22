@@ -11,15 +11,19 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CurrentUser
 from app.broker import publish_task
-from app.dag import InvalidDAGError, build_dag_payload
+from app.dag import InvalidDAGError, build_dag_payload, topological_order
 from app.database import get_db
-from app.models import Execution, ExecutionStatus, Node, Workflow
+from app.models import Edge, Execution, ExecutionStatus, Node, Workflow
 from app.pydantic_schemas import (
+    EdgeCreate,
+    EdgeRead,
+    EdgeUpdate,
     ExecutionQueued,
     ExecutionRead,
     NodeCreate,
@@ -71,6 +75,63 @@ async def get_owned_node(
     if node is None:
         raise _not_found("node")
     return node
+
+
+async def get_owned_edge(
+    db: AsyncSession, user_id: uuid.UUID, workflow_id: uuid.UUID, edge_id: uuid.UUID
+) -> Edge:
+    edge = await db.scalar(
+        select(Edge)
+        .join(Workflow, Edge.workflow_id == Workflow.id)
+        .where(Edge.id == edge_id, Edge.workflow_id == workflow_id, Workflow.user_id == user_id)
+    )
+    if edge is None:
+        raise _not_found("edge")
+    return edge
+
+
+async def validate_edge(
+    db: AsyncSession,
+    workflow_id: uuid.UUID,
+    source: uuid.UUID,
+    target: uuid.UUID,
+    *,
+    replacing: uuid.UUID | None = None,
+) -> None:
+    """Reject edges that are self-loops, leave the workflow, duplicate an
+    existing edge, or would close a cycle. `replacing` is the id of an edge
+    being updated, which is left out of the duplicate and cycle checks."""
+    if source == target:
+        raise HTTPException(status_code=422, detail="an edge cannot connect a node to itself")
+
+    found = await db.scalar(
+        select(func.count()).select_from(Node).where(Node.workflow_id == workflow_id, Node.id.in_([source, target]))
+    )
+    if found != 2:
+        raise HTTPException(status_code=422, detail="source and target must be nodes of this workflow")
+
+    existing = [
+        (e.source_node_id, e.target_node_id)
+        for e in await db.scalars(select(Edge).where(Edge.workflow_id == workflow_id))
+        if e.id != replacing
+    ]
+    if (source, target) in existing:
+        raise HTTPException(status_code=409, detail="edge already exists")
+    try:
+        topological_order([], [*existing, (source, target)])
+    except InvalidDAGError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def commit_edge(db: AsyncSession, edge: Edge) -> Edge:
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # A concurrent request inserted the same edge after validate_edge ran.
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="edge already exists") from exc
+    await db.refresh(edge)
+    return edge
 
 
 # --- Workflows ---------------------------------------------------------------
@@ -170,7 +231,63 @@ async def update_node(
 )
 async def delete_node(workflow_id: uuid.UUID, node_id: uuid.UUID, user_id: CurrentUser, db: DB) -> Response:
     node = await get_owned_node(db, user_id, workflow_id, node_id)
+    # Its edges go with it (ON DELETE CASCADE).
     await db.delete(node)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- Edges -------------------------------------------------------------------
+
+
+@router.post(
+    "/workflows/{workflow_id}/edges",
+    response_model=EdgeRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["edges"],
+)
+async def create_edge(workflow_id: uuid.UUID, body: EdgeCreate, user_id: CurrentUser, db: DB) -> Edge:
+    workflow = await get_owned_workflow(db, user_id, workflow_id)
+    await validate_edge(db, workflow.id, body.source_node_id, body.target_node_id)
+    edge = Edge(workflow_id=workflow.id, **body.model_dump())
+    db.add(edge)
+    return await commit_edge(db, edge)
+
+
+@router.get("/workflows/{workflow_id}/edges", response_model=list[EdgeRead], tags=["edges"])
+async def list_edges(
+    workflow_id: uuid.UUID, user_id: CurrentUser, db: DB, limit: Limit = 200, offset: Offset = 0
+) -> list[Edge]:
+    workflow = await get_owned_workflow(db, user_id, workflow_id)
+    result = await db.scalars(
+        select(Edge).where(Edge.workflow_id == workflow.id).order_by(Edge.id).limit(limit).offset(offset)
+    )
+    return list(result)
+
+
+@router.get("/workflows/{workflow_id}/edges/{edge_id}", response_model=EdgeRead, tags=["edges"])
+async def get_edge(workflow_id: uuid.UUID, edge_id: uuid.UUID, user_id: CurrentUser, db: DB) -> Edge:
+    return await get_owned_edge(db, user_id, workflow_id, edge_id)
+
+
+@router.patch("/workflows/{workflow_id}/edges/{edge_id}", response_model=EdgeRead, tags=["edges"])
+async def update_edge(
+    workflow_id: uuid.UUID, edge_id: uuid.UUID, body: EdgeUpdate, user_id: CurrentUser, db: DB
+) -> Edge:
+    edge = await get_owned_edge(db, user_id, workflow_id, edge_id)
+    source = body.source_node_id or edge.source_node_id
+    target = body.target_node_id or edge.target_node_id
+    await validate_edge(db, edge.workflow_id, source, target, replacing=edge.id)
+    edge.source_node_id, edge.target_node_id = source, target
+    return await commit_edge(db, edge)
+
+
+@router.delete(
+    "/workflows/{workflow_id}/edges/{edge_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["edges"]
+)
+async def delete_edge(workflow_id: uuid.UUID, edge_id: uuid.UUID, user_id: CurrentUser, db: DB) -> Response:
+    edge = await get_owned_edge(db, user_id, workflow_id, edge_id)
+    await db.delete(edge)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -189,11 +306,12 @@ async def execute_workflow(workflow_id: uuid.UUID, user_id: CurrentUser, db: DB)
     nodes = list(await db.scalars(select(Node).where(Node.workflow_id == workflow.id)))
     if not nodes:
         raise HTTPException(status_code=422, detail="workflow has no nodes")
+    edges = list(await db.scalars(select(Edge).where(Edge.workflow_id == workflow.id)))
 
     execution = Execution(id=uuid.uuid4(), workflow_id=workflow.id, status=ExecutionStatus.PENDING)
     # Validate the graph before writing anything, so a bad DAG leaves no record.
     try:
-        payload = build_dag_payload(workflow, nodes, execution)
+        payload = build_dag_payload(workflow, nodes, edges, execution)
     except InvalidDAGError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -208,6 +326,7 @@ async def execute_workflow(workflow_id: uuid.UUID, user_id: CurrentUser, db: DB)
         # The broker never accepted the task, so nothing will pick it up.
         execution.status = ExecutionStatus.FAILED
         execution.completed_at = datetime.now(timezone.utc)
+        execution.error_message = f"could not queue execution: {type(exc).__name__}: {exc}"
         await db.commit()
         raise HTTPException(status_code=503, detail="could not queue execution") from exc
 

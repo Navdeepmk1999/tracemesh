@@ -3,7 +3,18 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func, text
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    ForeignKeyConstraint,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,6 +53,9 @@ class Workflow(Base):
     nodes: Mapped[list["Node"]] = relationship(
         back_populates="workflow", cascade="all, delete-orphan", passive_deletes=True
     )
+    edges: Mapped[list["Edge"]] = relationship(
+        back_populates="workflow", cascade="all, delete-orphan", passive_deletes=True
+    )
     executions: Mapped[list["Execution"]] = relationship(
         back_populates="workflow", cascade="all, delete-orphan", passive_deletes=True
     )
@@ -49,6 +63,8 @@ class Workflow(Base):
 
 class Node(Base):
     __tablename__ = "nodes"
+    # Target for edges' composite foreign keys (see Edge).
+    __table_args__ = (UniqueConstraint("workflow_id", "id"),)
 
     id: Mapped[uuid.UUID] = uuid_pk()
     workflow_id: Mapped[uuid.UUID] = mapped_column(
@@ -60,6 +76,39 @@ class Node(Base):
     )
 
     workflow: Mapped[Workflow] = relationship(back_populates="nodes")
+
+
+class Edge(Base):
+    """A dependency: target_node runs after source_node."""
+
+    __tablename__ = "edges"
+    __table_args__ = (
+        # Composite FKs pin both endpoints to this edge's workflow, so the
+        # database itself rejects edges that cross workflows (or tenants).
+        ForeignKeyConstraint(
+            ["workflow_id", "source_node_id"],
+            ["nodes.workflow_id", "nodes.id"],
+            ondelete="CASCADE",
+            name="fk_edges_source_node_nodes",
+        ),
+        ForeignKeyConstraint(
+            ["workflow_id", "target_node_id"],
+            ["nodes.workflow_id", "nodes.id"],
+            ondelete="CASCADE",
+            name="fk_edges_target_node_nodes",
+        ),
+        UniqueConstraint("source_node_id", "target_node_id"),
+        CheckConstraint("source_node_id <> target_node_id", name="no_self_loop"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    workflow_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("workflows.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    target_node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+
+    workflow: Mapped[Workflow] = relationship(back_populates="edges")
 
 
 class Execution(Base):
@@ -79,5 +128,7 @@ class Execution(Base):
     # Nullable: a PENDING execution has not started yet.
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Why a FAILED execution failed; cleared when an execution is (re)claimed.
+    error_message: Mapped[str | None] = mapped_column(String)
 
     workflow: Mapped[Workflow] = relationship(back_populates="executions")
