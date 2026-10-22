@@ -1,0 +1,4 @@
+backend/tracemesh-env/
+backend/__pycache__/
+backend/.env
+.DS_Store
