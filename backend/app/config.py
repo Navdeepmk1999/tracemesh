@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     migration_database_url: str | None = None
     db_echo: bool = False
 
+    # AMQP broker, e.g. amqps://<user>:<password>@<host>/<vhost> (CloudAMQP)
+    rabbitmq_url: str
+    # Unacked messages a single worker may hold at once.
+    worker_prefetch_count: int = 1
+
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
 
