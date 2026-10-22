@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     migration_database_url: str | None = None
     db_echo: bool = False
 
+    # Supabase Auth. Legacy projects sign user JWTs with HS256 and this shared
+    # secret (Project Settings > API > JWT Secret).
+    supabase_jwt_secret: str | None = None
+    # https://<project-ref>.supabase.co. Enables verifying asymmetric (ES256/RS256)
+    # tokens against the project's JWKS, and checks the token issuer.
+    supabase_url: str | None = None
+    jwt_audience: str = "authenticated"
+
     # AMQP broker, e.g. amqps://<user>:<password>@<host>/<vhost> (CloudAMQP)
     rabbitmq_url: str
     # Unacked messages a single worker may hold at once.

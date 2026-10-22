@@ -30,6 +30,9 @@ class Workflow(Base):
     __tablename__ = "workflows"
 
     id: Mapped[uuid.UUID] = uuid_pk()
+    # Supabase auth user (JWT `sub`) that owns this workflow. Every API query
+    # filters on it; nodes and executions inherit ownership through workflow_id.
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
