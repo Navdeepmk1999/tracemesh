@@ -16,8 +16,8 @@ export async function NavBar() {
         </Link>
         {user && (
           <nav className="hidden items-center gap-4 text-sm text-zinc-600 sm:flex dark:text-zinc-400">
-            <Link href="/workflows/new" className="hover:text-zinc-950 dark:hover:text-zinc-50">
-              Canvas
+            <Link href="/workflows" className="hover:text-zinc-950 dark:hover:text-zinc-50">
+              Workflows
             </Link>
           </nav>
         )}
