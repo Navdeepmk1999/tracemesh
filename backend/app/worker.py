@@ -27,7 +27,7 @@ from sqlalchemy import update
 from app.broker import TASK_QUEUE, declare_task_queues
 from app.config import get_settings
 from app.database import SessionLocal, engine
-from app.models import Execution, ExecutionStatus
+from app.models import Execution, ExecutionStatus, NodeRun
 from app.telemetry import close_redis, publish_trace
 
 SIMULATED_SECONDS_PER_NODE = 1
@@ -119,6 +119,41 @@ async def set_status(
         return result.scalar_one_or_none() is not None
 
 
+async def claim_execution(execution_id: uuid.UUID) -> bool:
+    """Move a claimable execution to RUNNING and reset its node runs, atomically.
+
+    Resetting matters on redelivery: a crashed attempt may have left nodes
+    RUNNING or COMPLETED, and hydration must not show that stale progress.
+    """
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session, session.begin():
+        claimed = await session.scalar(
+            update(Execution)
+            .where(Execution.id == execution_id, Execution.status.in_(CLAIMABLE))
+            .values(status=ExecutionStatus.RUNNING, started_at=now, completed_at=None, error_message=None)
+            .returning(Execution.id)
+        )
+        if claimed is None:
+            return False
+        await session.execute(
+            update(NodeRun)
+            .where(NodeRun.execution_id == execution_id)
+            .values(status=ExecutionStatus.PENDING, started_at=None, completed_at=None, error_message=None)
+        )
+        return True
+
+
+async def set_node_status(
+    execution_id: uuid.UUID, node_id: str, new_status: ExecutionStatus, **values: Any
+) -> None:
+    async with SessionLocal() as session, session.begin():
+        await session.execute(
+            update(NodeRun)
+            .where(NodeRun.execution_id == execution_id, NodeRun.node_id == uuid.UUID(node_id))
+            .values(status=new_status, **values)
+        )
+
+
 async def run_node(node: dict[str, Any]) -> None:
     """Simulated agent work. Set config.simulate_failure to make a node raise."""
     await asyncio.sleep(SIMULATED_SECONDS_PER_NODE)
@@ -131,15 +166,31 @@ async def run_execution(nodes: list[dict[str, Any]], tracer: Tracer) -> None:
     total = len(nodes)
     for i, node in enumerate(nodes, start=1):
         node_info = {"node_id": node.get("id"), "node_type": node.get("node_type"), "index": i, "total": total}
-        log(f"  {tracer.execution_id} node {i}/{total} {node_info['node_type']} ({node_info['node_id']})")
+        node_id = node_info["node_id"]
+        log(f"  {tracer.execution_id} node {i}/{total} {node_info['node_type']} ({node_id})")
+        # Each DB write lands before its trace event, so hydration is never
+        # behind the stream.
+        await set_node_status(
+            tracer.execution_id, node_id, ExecutionStatus.RUNNING, started_at=datetime.now(timezone.utc)
+        )
         await tracer.emit("node.started", **node_info)
         start = time.monotonic()
         try:
             await run_node(node)
         except Exception as exc:
-            error = f"node {node_info['node_id']} ({node_info['node_type']}) failed: {describe(exc)}"
+            error = f"node {node_id} ({node_info['node_type']}) failed: {describe(exc)}"[:MAX_ERROR_LENGTH]
+            await set_node_status(
+                tracer.execution_id,
+                node_id,
+                ExecutionStatus.FAILED,
+                completed_at=datetime.now(timezone.utc),
+                error_message=error,
+            )
             await tracer.emit("node.failed", **node_info, duration_ms=elapsed_ms(start), error=error)
-            raise NodeFailed(error[:MAX_ERROR_LENGTH]) from exc
+            raise NodeFailed(error) from exc
+        await set_node_status(
+            tracer.execution_id, node_id, ExecutionStatus.COMPLETED, completed_at=datetime.now(timezone.utc)
+        )
         await tracer.emit("node.completed", **node_info, duration_ms=elapsed_ms(start))
 
 
@@ -153,15 +204,7 @@ async def handle_message(message: AbstractIncomingMessage) -> None:
         return
 
     try:
-        claimed = await set_status(
-            execution_id,
-            ExecutionStatus.RUNNING,
-            only_from=CLAIMABLE,
-            started_at=datetime.now(timezone.utc),
-            completed_at=None,
-            error_message=None,
-        )
-        if not claimed:
+        if not await claim_execution(execution_id):
             # Already COMPLETED/FAILED (duplicate delivery), or the workflow
             # was deleted. Either way there is nothing left to do.
             log(f"skipped {execution_id}: already finished or no longer exists")

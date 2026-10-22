@@ -63,6 +63,24 @@ def decode_supabase_jwt(token: str) -> dict[str, Any]:
     )
 
 
+class InvalidToken(Exception):
+    pass
+
+
+def user_id_from_token(token: str) -> uuid.UUID:
+    """Verify a Supabase JWT and return its user id; raises InvalidToken.
+
+    Shared by the HTTP dependency and the WebSocket handshake. May block on a
+    JWKS fetch, so async callers should run it in a thread.
+    """
+    try:
+        claims = decode_supabase_jwt(token)
+        # Anon/service-role keys are JWTs too, but have no user `sub`.
+        return uuid.UUID(claims["sub"])
+    except (jwt.PyJWTError, ValueError, TypeError, KeyError) as exc:
+        raise InvalidToken(str(exc)) from exc
+
+
 # A sync dependency: FastAPI runs it in a threadpool, so the (rare) blocking
 # JWKS fetch doesn't stall the event loop.
 def get_current_user(
@@ -72,10 +90,8 @@ def get_current_user(
     if credentials is None:
         raise _unauthorized("missing bearer token")
     try:
-        claims = decode_supabase_jwt(credentials.credentials)
-        # Anon/service-role keys are JWTs too, but have no user `sub`.
-        return uuid.UUID(claims["sub"])
-    except (jwt.PyJWTError, ValueError, TypeError) as exc:
+        return user_id_from_token(credentials.credentials)
+    except InvalidToken as exc:
         raise _unauthorized("invalid or expired token") from exc
 
 

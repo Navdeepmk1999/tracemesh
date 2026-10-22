@@ -82,6 +82,15 @@ class EdgeRead(ORMModel):
 # --- Executions --------------------------------------------------------------
 
 
+class NodeRunRead(ORMModel):
+    node_id: uuid.UUID
+    node_type: str
+    status: ExecutionStatus
+    started_at: datetime | None
+    completed_at: datetime | None
+    error_message: str | None
+
+
 class ExecutionQueued(BaseModel):
     # Status starts as PENDING; the worker owns all later transitions.
     execution_id: uuid.UUID

@@ -12,6 +12,8 @@ from app.api import router as api_router
 from app.broker import broker
 from app.config import get_settings
 from app.database import engine, get_db
+from app.telemetry import close_redis
+from app.websockets import router as ws_router
 
 settings = get_settings()
 
@@ -23,6 +25,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await broker.close()
+        await close_redis()
         await engine.dispose()
 
 
@@ -37,6 +40,7 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+app.include_router(ws_router)
 
 
 @app.get("/health", tags=["meta"])
