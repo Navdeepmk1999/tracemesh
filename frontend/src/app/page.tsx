@@ -15,10 +15,10 @@ export default async function Home() {
       <div>
         {/* The proxy sends signed-out users to /login and back here after. */}
         <Link
-          href={user ? "/workflows/new" : "/login?next=/workflows/new"}
+          href={user ? "/workflows" : "/login?next=/workflows"}
           className="inline-flex items-center gap-2 rounded-md bg-violet-600 px-4 py-2 font-medium text-white hover:bg-violet-500"
         >
-          {user ? "Open the canvas" : "Sign in to start"}
+          {user ? "Open your workflows" : "Sign in to start"}
           <ArrowRight className="size-4" aria-hidden />
         </Link>
       </div>

@@ -19,15 +19,31 @@ import {
   type IsValidConnection,
   type OnConnectEnd,
 } from "@xyflow/react";
-import { MousePointerClick } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type DragEvent } from "react";
+import { AlertTriangle, LoaderCircle, MousePointerClick, Play, Save, X } from "lucide-react";
+import { useRouter } from "next/navigation";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type DragEvent,
+} from "react";
 
 import "@xyflow/react/dist/style.css";
 
 import { createNode, nodeTypes, type WorkflowNode, type WorkflowNodeType } from "@/components/nodes";
+import { useExecutionTrace, type TraceState } from "@/hooks/use-execution-trace";
+import { ApiError, createApiClient, type ApiClient, type TokenProvider } from "@/lib/api/client";
+import { getSupabaseAccessToken } from "@/lib/api/token";
+import type { ApiWorkflow } from "@/lib/api/types";
+import { cn } from "@/lib/cn";
 
 import { connectionError } from "./graph-rules";
+import { applyIdMap, fromApi, isDirty, SyncError, syncGraph, type GraphSnapshot } from "./graph-sync";
 import { NODE_DRAG_MIME, NodePalette } from "./node-palette";
+import { RunStateContext } from "./run-state";
 
 const NODE_TYPES = new Set<string>(Object.keys(nodeTypes));
 
@@ -50,58 +66,204 @@ const MINIMAP_COLORS: Record<WorkflowNodeType, string> = {
   webhook: "#f59e0b",
 };
 
-// A starter graph so the canvas isn't empty on first open. PR 7 replaces this
-// with the workflow loaded from the API. Fixed ids keep it stable across
-// remounts (e.g. React strict mode).
-function starterGraph(): { nodes: WorkflowNode[]; edges: Edge[] } {
-  const trigger = createNode("trigger", { x: 0, y: 64 }, "00000000-0000-4000-8000-000000000001");
-  const agent = createNode("agent", { x: 288, y: 32 }, "00000000-0000-4000-8000-000000000002");
-  const webhook = createNode("webhook", { x: 640, y: 64 }, "00000000-0000-4000-8000-000000000003");
-  agent.data = {
-    label: "Research agent",
-    model: "claude-sonnet-5-5",
-    instructions: "Summarize the incoming request and draft a reply.",
-  };
-  webhook.data = { label: "Notify Slack", method: "POST", url: "https://hooks.example.com/tracemesh" };
-  return {
-    nodes: [trigger, agent, webhook],
-    edges: [
-      { id: "00000000-0000-4000-8000-0000000000e1", source: trigger.id, target: agent.id },
-      { id: "00000000-0000-4000-8000-0000000000e2", source: agent.id, target: webhook.id },
-    ],
-  };
-}
-
 const noopSubscribe = () => () => {};
 
-export function WorkflowCanvas({ workflowId }: { workflowId: string }) {
+type WorkflowCanvasProps = {
+  workflowId: string;
+  /** Where the backend JWT comes from; the signed-in Supabase session by default. */
+  getToken?: TokenProvider;
+};
+
+export function WorkflowCanvas({ workflowId, getToken = getSupabaseAccessToken }: WorkflowCanvasProps) {
   // Client-only: React Flow resolves colorMode="system" from matchMedia, which
   // the server can't know, so server HTML would hydrate with the wrong theme
   // class. The server sends a placeholder; the canvas mounts in the browser.
   const isClient = useSyncExternalStore(noopSubscribe, () => true, () => false);
-  if (!isClient) {
-    return <div className="h-full w-full animate-pulse bg-zinc-50 dark:bg-zinc-900" aria-busy="true" />;
-  }
+  if (!isClient) return <CanvasPlaceholder />;
 
   return (
     // Keyed by workflow so navigating between workflows starts fresh state.
     <ReactFlowProvider key={workflowId}>
-      <Canvas />
+      <WorkflowLoader workflowId={workflowId} getToken={getToken} />
     </ReactFlowProvider>
   );
 }
 
-function Canvas() {
-  const [initial] = useState(starterGraph);
-  const [nodes, setNodes, onNodesChange] = useNodesState<WorkflowNode>(initial.nodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initial.edges);
+function CanvasPlaceholder({ children }: { children?: React.ReactNode }) {
+  return (
+    <div className="flex h-full w-full items-center justify-center bg-zinc-50 dark:bg-zinc-900" aria-busy={!children}>
+      {children ?? <LoaderCircle className="size-6 animate-spin text-zinc-400" aria-label="Loading workflow" />}
+    </div>
+  );
+}
+
+type Loaded = { workflow: ApiWorkflow } & ReturnType<typeof fromApi>;
+
+/** Fetches the workflow, then mounts the canvas with it, so React Flow's
+ * fitView frames the real graph on first render. */
+function WorkflowLoader({ workflowId, getToken }: { workflowId: string; getToken: TokenProvider }) {
+  const router = useRouter();
+  const api = useMemo(() => createApiClient(getToken), [getToken]);
+  const [loaded, setLoaded] = useState<Loaded | null>(null);
+  const [error, setError] = useState<ApiError | null>(null);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([api.getWorkflow(workflowId), api.listNodes(workflowId), api.listEdges(workflowId)])
+      .then(([workflow, nodes, edges]) => {
+        if (!cancelled) setLoaded({ workflow, ...fromApi(nodes, edges) });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const apiError = err instanceof ApiError ? err : new ApiError(0, "Couldn't load this workflow");
+        if (apiError.status === 401) {
+          router.replace(`/login?next=${encodeURIComponent(`/workflows/${workflowId}`)}`);
+          return;
+        }
+        setError(apiError);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, workflowId, attempt, router]);
+
+  if (loaded) return <Canvas api={api} getToken={getToken} {...loaded} />;
+  if (!error) return <CanvasPlaceholder />;
+
+  // A malformed id is a 422 from the API; to the user it's also "not found".
+  const notFound = error.status === 404 || error.status === 422;
+  return (
+    <CanvasPlaceholder>
+      <div className="max-w-sm text-center">
+        <AlertTriangle className="mx-auto mb-3 size-6 text-amber-500" aria-hidden />
+        <p className="font-medium">{notFound ? "Workflow not found" : "Couldn't load this workflow"}</p>
+        <p className="mt-1 text-sm text-zinc-500">
+          {notFound ? "It may have been deleted, or it belongs to another account." : error.message}
+        </p>
+        {!notFound && (
+          <button
+            type="button"
+            onClick={() => {
+              setError(null);
+              setAttempt((n) => n + 1);
+            }}
+            className="mt-4 rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          >
+            Try again
+          </button>
+        )}
+      </div>
+    </CanvasPlaceholder>
+  );
+}
+
+type CanvasProps = Loaded & { api: ApiClient; getToken: TokenProvider };
+
+function Canvas({ api, getToken, workflow, nodes: initialNodes, edges: initialEdges, snapshot }: CanvasProps) {
+  const [nodes, setNodes, onNodesChange] = useNodesState<WorkflowNode>(initialNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initialEdges);
   const { screenToFlowPosition, getNodes, getEdges, getIntersectingNodes } = useReactFlow<WorkflowNode, Edge>();
   const wrapper = useRef<HTMLDivElement>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  // --- Persistence --------------------------------------------------------
+
+  const [saved, setSaved] = useState<GraphSnapshot>(snapshot);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const dirty = useMemo(() => isDirty(saved, nodes, edges), [saved, nodes, edges]);
+
+  /** Push local changes to the API. Resolves true if everything saved. */
+  const save = useCallback(async (): Promise<boolean> => {
+    if (savingRef.current) return false;
+    savingRef.current = true;
+    setSaving(true);
+    let ok = true;
+    try {
+      // Read the latest graph at call time, not from a stale render.
+      let result;
+      try {
+        result = await syncGraph(api, workflow.id, saved, getNodes(), getEdges());
+      } catch (err) {
+        if (!(err instanceof SyncError)) throw err;
+        ok = false;
+        result = err.partial; // keep what did save, so a retry only redoes the rest
+        setNotice(`Save failed: ${err.message}`);
+      }
+      const { idMap } = result;
+      // Swap local ids for server ids, via functional updates so edits made
+      // while the save was in flight are kept.
+      setNodes((nds) => applyIdMap(idMap, nds, []).nodes);
+      setEdges((eds) => applyIdMap(idMap, [], eds).edges);
+      setSaved(result.snapshot);
+    } catch (err) {
+      ok = false;
+      setNotice(`Save failed: ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+    return ok;
+  }, [api, workflow.id, saved, getNodes, getEdges, setNodes, setEdges]);
+
+  // Cmd/Ctrl+S saves instead of opening the browser's "Save page" dialog.
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void save();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [save]);
+
+  // Warn before closing the tab with unsaved changes.
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+
+  // --- Execution ----------------------------------------------------------
+
+  const [executionId, setExecutionId] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const trace = useExecutionTrace(executionId, getToken);
+  const runActive =
+    starting || (executionId !== null && trace.connection !== "error" && !["COMPLETED", "FAILED"].includes(trace.status ?? ""));
+
+  const execute = useCallback(async () => {
+    setStarting(true);
+    try {
+      // The worker runs what the server has, so unsaved edits go first.
+      if (dirty && !(await save())) return;
+      if (getNodes().length === 0) {
+        setNotice("Add at least one node before running");
+        return;
+      }
+      const queued = await api.execute(workflow.id);
+      setExecutionId(queued.execution_id);
+    } catch (err) {
+      setNotice(`Couldn't start the run: ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      setStarting(false);
+    }
+  }, [api, workflow.id, dirty, save, getNodes]);
+
+  // Animate edges flowing into a running node.
+  const renderedEdges = useMemo(
+    () => edges.map((e) => (trace.nodes[e.target]?.status === "RUNNING" ? { ...e, animated: true } : e)),
+    [edges, trace.nodes],
+  );
+
+  // --- Editing ------------------------------------------------------------
+
   useEffect(() => {
     if (!notice) return;
-    const timer = setTimeout(() => setNotice(null), 3000);
+    const timer = setTimeout(() => setNotice(null), 4000);
     return () => clearTimeout(timer);
   }, [notice]);
 
@@ -186,68 +348,201 @@ function Canvas() {
   );
 
   return (
-    <div ref={wrapper} className="h-full w-full">
-      <ReactFlow<WorkflowNode, Edge>
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
-        onConnectEnd={onConnectEnd}
-        isValidConnection={isValidConnection}
-        onDrop={onDrop}
-        onDragOver={onDragOver}
-        defaultEdgeOptions={defaultEdgeOptions}
-        deleteKeyCode={["Backspace", "Delete"]}
-        snapToGrid
-        snapGrid={[16, 16]}
-        fitView
-        fitViewOptions={{ padding: 0.3, maxZoom: 1 }}
-        minZoom={0.2}
-        colorMode="system"
+    <RunStateContext.Provider value={trace.nodes}>
+      <div ref={wrapper} className="h-full w-full">
+        <ReactFlow<WorkflowNode, Edge>
+          nodes={nodes}
+          edges={renderedEdges}
+          nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={onConnect}
+          onConnectEnd={onConnectEnd}
+          isValidConnection={isValidConnection}
+          onDrop={onDrop}
+          onDragOver={onDragOver}
+          defaultEdgeOptions={defaultEdgeOptions}
+          deleteKeyCode={["Backspace", "Delete"]}
+          snapToGrid
+          snapGrid={[16, 16]}
+          fitView
+          fitViewOptions={{ padding: 0.3, maxZoom: 1 }}
+          minZoom={0.2}
+          colorMode="system"
+        >
+          <Background variant={BackgroundVariant.Dots} gap={16} size={1.5} />
+          <Controls showInteractive={false} />
+          <MiniMap
+            pannable
+            zoomable
+            className="hidden! sm:block!"
+            nodeColor={(n) => MINIMAP_COLORS[n.type as WorkflowNodeType] ?? "#a1a1aa"}
+          />
+
+          <Panel position="top-left">
+            <NodePalette onAdd={addNodeAtCenter} />
+          </Panel>
+
+          <Panel position="top-right">
+            <Toolbar
+              name={workflow.name}
+              dirty={dirty}
+              saving={saving}
+              runActive={runActive}
+              starting={starting}
+              onSave={() => void save()}
+              onExecute={() => void execute()}
+            />
+          </Panel>
+
+          {executionId && (
+            <Panel position="bottom-center" className="mb-16!">
+              <RunPanel
+                executionId={executionId}
+                trace={trace}
+                total={nodes.length}
+                onDismiss={runActive ? undefined : () => setExecutionId(null)}
+              />
+            </Panel>
+          )}
+
+          {nodes.length === 0 && (
+            <Panel position="top-center" className="pointer-events-none mt-40!">
+              <div className="flex items-center gap-2 rounded-lg border border-dashed border-zinc-300 bg-white/90 px-4 py-3 text-sm text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900/90">
+                <MousePointerClick className="size-4" aria-hidden />
+                Drag a node from the palette to start building.
+              </div>
+            </Panel>
+          )}
+
+          {notice && (
+            <Panel position="bottom-center">
+              <div
+                role="alert"
+                className="rounded-md bg-zinc-900 px-3 py-2 text-sm text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900"
+              >
+                {notice}
+              </div>
+            </Panel>
+          )}
+        </ReactFlow>
+      </div>
+    </RunStateContext.Provider>
+  );
+}
+
+type ToolbarProps = {
+  name: string;
+  dirty: boolean;
+  saving: boolean;
+  runActive: boolean;
+  starting: boolean;
+  onSave: () => void;
+  onExecute: () => void;
+};
+
+function Toolbar({ name, dirty, saving, runActive, starting, onSave, onExecute }: ToolbarProps) {
+  const saveState = saving ? "Saving…" : dirty ? "Unsaved changes" : "All changes saved";
+  return (
+    <div className="flex items-center gap-2 rounded-lg border border-zinc-200 bg-white/95 p-1.5 pl-3 shadow-sm backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/95">
+      <div className="mr-1 hidden min-w-0 flex-col md:flex">
+        <span className="max-w-48 truncate text-sm font-medium" title={name}>
+          {name}
+        </span>
+        <span className={cn("text-[11px]", dirty && !saving ? "text-amber-600 dark:text-amber-400" : "text-zinc-500")}>
+          {saveState}
+        </span>
+      </div>
+      <button
+        type="button"
+        onClick={onSave}
+        disabled={!dirty || saving}
+        title="Save (⌘S)"
+        className="flex items-center gap-1.5 rounded-md border border-zinc-300 px-2.5 py-1.5 text-sm font-medium hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:hover:bg-zinc-800"
       >
-        <Background variant={BackgroundVariant.Dots} gap={16} size={1.5} />
-        <Controls showInteractive={false} />
-        <MiniMap
-          pannable
-          zoomable
-          className="hidden! sm:block!"
-          nodeColor={(n) => MINIMAP_COLORS[n.type as WorkflowNodeType] ?? "#a1a1aa"}
-        />
-
-        <Panel position="top-left">
-          <NodePalette onAdd={addNodeAtCenter} />
-        </Panel>
-
-        <Panel position="top-right" className="hidden md:block">
-          <div className="rounded-lg border border-zinc-200 bg-white/95 px-3 py-2 text-xs text-zinc-500 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/95">
-            {nodes.length} nodes · {edges.length} connections
-            <span className="mx-1.5">·</span>
-            Drag from a handle to connect · Backspace deletes
-          </div>
-        </Panel>
-
-        {nodes.length === 0 && (
-          <Panel position="top-center" className="pointer-events-none mt-40!">
-            <div className="flex items-center gap-2 rounded-lg border border-dashed border-zinc-300 bg-white/90 px-4 py-3 text-sm text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900/90">
-              <MousePointerClick className="size-4" aria-hidden />
-              Drag a node from the palette to start building.
-            </div>
-          </Panel>
+        {saving ? <LoaderCircle className="size-4 animate-spin" aria-hidden /> : <Save className="size-4" aria-hidden />}
+        Save
+      </button>
+      <button
+        type="button"
+        onClick={onExecute}
+        disabled={runActive || saving}
+        title={dirty ? "Saves your changes, then runs the workflow" : "Run the workflow"}
+        className="flex items-center gap-1.5 rounded-md bg-violet-600 px-2.5 py-1.5 text-sm font-medium text-white hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {runActive ? (
+          <LoaderCircle className="size-4 animate-spin" aria-hidden />
+        ) : (
+          <Play className="size-4" aria-hidden />
         )}
+        {starting ? "Starting…" : runActive ? "Running…" : "Execute"}
+      </button>
+    </div>
+  );
+}
 
-        {notice && (
-          <Panel position="bottom-center">
-            <div
-              role="status"
-              className="rounded-md bg-zinc-900 px-3 py-2 text-sm text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900"
-            >
-              {notice}
-            </div>
-          </Panel>
+const RUN_TONES: Record<string, string> = {
+  PENDING: "bg-zinc-400",
+  RUNNING: "bg-sky-500 animate-pulse",
+  COMPLETED: "bg-emerald-500",
+  FAILED: "bg-red-500",
+};
+
+function RunPanel({
+  executionId,
+  trace,
+  total,
+  onDismiss,
+}: {
+  executionId: string;
+  trace: TraceState;
+  total: number;
+  onDismiss?: () => void;
+}) {
+  const done = Object.values(trace.nodes).filter((n) => n.status === "COMPLETED").length;
+  const label =
+    trace.connection === "error"
+      ? "Disconnected"
+      : trace.status === null
+        ? "Connecting…"
+        : trace.status.charAt(0) + trace.status.slice(1).toLowerCase();
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex max-w-[min(32rem,calc(100vw-2rem))] items-start gap-3 rounded-lg border border-zinc-200 bg-white/95 px-3 py-2 text-sm shadow-lg backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/95"
+    >
+      <span
+        className={cn(
+          "mt-1.5 size-2 shrink-0 rounded-full",
+          trace.connection === "error" ? "bg-amber-500" : RUN_TONES[trace.status ?? "PENDING"],
         )}
-      </ReactFlow>
+        aria-hidden
+      />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline gap-2">
+          <span className="font-medium">{label}</span>
+          <span className="text-xs text-zinc-500">
+            {done}/{Object.keys(trace.nodes).length || total} nodes ·{" "}
+            <code className="font-mono" title={executionId}>
+              {executionId.slice(0, 8)}
+            </code>
+            {trace.connection === "connecting" && trace.status && " · reconnecting…"}
+          </span>
+        </div>
+        {trace.error && <p className="mt-0.5 line-clamp-2 text-xs text-red-600 dark:text-red-400">{trace.error}</p>}
+      </div>
+      {onDismiss && (
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Clear run results"
+          className="rounded p-0.5 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800"
+        >
+          <X className="size-4" />
+        </button>
+      )}
     </div>
   );
 }
