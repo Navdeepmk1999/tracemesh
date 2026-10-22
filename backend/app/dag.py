@@ -1,43 +1,52 @@
-"""Turn a workflow's nodes into the DAG payload the worker executes.
-
-Edges live in each node's config as `"depends_on": ["<node uuid>", ...]`.
-"""
+"""Turn a workflow's nodes and edges into the DAG payload the worker executes."""
 
 import uuid
+from collections.abc import Iterable
 from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
-from app.models import Execution, Node, Workflow
+from app.models import Edge, Execution, Node, Workflow
 
 
 class InvalidDAGError(ValueError):
     pass
 
 
-def _dependencies(node: Node, node_ids: set[str]) -> list[str]:
-    raw = (node.config_json or {}).get("depends_on", [])
-    if not isinstance(raw, list):
-        raise InvalidDAGError(f"node {node.id}: depends_on must be a list of node ids")
-    deps: list[str] = []
-    for dep in raw:
-        try:
-            dep_id = str(uuid.UUID(str(dep)))
-        except ValueError:
-            raise InvalidDAGError(f"node {node.id}: {dep!r} is not a node id") from None
-        if dep_id not in node_ids:
-            raise InvalidDAGError(f"node {node.id}: depends on {dep_id}, which is not in this workflow")
-        deps.append(dep_id)
-    return deps
+def _dependency_graph(
+    node_ids: Iterable[uuid.UUID], edges: Iterable[tuple[uuid.UUID, uuid.UUID]]
+) -> dict[str, list[str]]:
+    """Map each node id to the ids it depends on (its edges' sources)."""
+    graph: dict[str, list[str]] = {str(n): [] for n in node_ids}
+    for source, target in edges:
+        graph.setdefault(str(target), []).append(str(source))
+        graph.setdefault(str(source), [])
+    return graph
 
 
-def build_dag_payload(workflow: Workflow, nodes: list[Node], execution: Execution) -> dict[str, Any]:
-    node_ids = {str(n.id) for n in nodes}
-    graph = {str(n.id): _dependencies(n, node_ids) for n in nodes}
+def topological_order(
+    node_ids: Iterable[uuid.UUID], edges: Iterable[tuple[uuid.UUID, uuid.UUID]]
+) -> list[str]:
+    """Node ids ordered so every node follows its dependencies.
+
+    Raises InvalidDAGError naming the cycle if there is one.
+    """
+    graph = _dependency_graph(node_ids, edges)
+    # Sort ids first so the order is deterministic for identical graphs.
+    sorter = TopologicalSorter({k: sorted(graph[k]) for k in sorted(graph)})
     try:
-        # Sort ids first so the order is deterministic for identical graphs.
-        order = list(TopologicalSorter({k: graph[k] for k in sorted(graph)}).static_order())
+        return list(sorter.static_order())
     except CycleError as exc:
         raise InvalidDAGError(f"workflow contains a cycle: {' -> '.join(exc.args[1])}") from None
+
+
+def build_dag_payload(
+    workflow: Workflow, nodes: list[Node], edges: list[Edge], execution: Execution
+) -> dict[str, Any]:
+    # Edges can only reference nodes of the same workflow (composite FKs), so
+    # the only thing left to validate here is acyclicity.
+    edge_pairs = [(e.source_node_id, e.target_node_id) for e in edges]
+    order = topological_order((n.id for n in nodes), edge_pairs)
+    graph = _dependency_graph((n.id for n in nodes), edge_pairs)
 
     return {
         "execution_id": str(execution.id),
@@ -48,9 +57,13 @@ def build_dag_payload(workflow: Workflow, nodes: list[Node], execution: Executio
                 "id": str(n.id),
                 "node_type": n.node_type,
                 "config": n.config_json,
-                "depends_on": graph[str(n.id)],
+                "depends_on": sorted(graph[str(n.id)]),
             }
             for n in nodes
+        ],
+        "edges": [
+            {"id": str(e.id), "source": str(e.source_node_id), "target": str(e.target_node_id)}
+            for e in edges
         ],
         # Node ids in an order where every node follows its dependencies.
         "order": order,

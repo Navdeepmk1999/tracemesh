@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models import ExecutionStatus
 
@@ -53,6 +53,32 @@ class NodeRead(ORMModel):
     config_json: dict[str, Any]
 
 
+# --- Edges -------------------------------------------------------------------
+
+
+class EdgeCreate(BaseModel):
+    source_node_id: uuid.UUID
+    target_node_id: uuid.UUID
+
+    @model_validator(mode="after")
+    def _no_self_loop(self) -> "EdgeCreate":
+        if self.source_node_id == self.target_node_id:
+            raise ValueError("an edge cannot connect a node to itself")
+        return self
+
+
+class EdgeUpdate(BaseModel):
+    source_node_id: uuid.UUID | None = None
+    target_node_id: uuid.UUID | None = None
+
+
+class EdgeRead(ORMModel):
+    id: uuid.UUID
+    workflow_id: uuid.UUID
+    source_node_id: uuid.UUID
+    target_node_id: uuid.UUID
+
+
 # --- Executions --------------------------------------------------------------
 
 
@@ -68,3 +94,4 @@ class ExecutionRead(ORMModel):
     status: ExecutionStatus
     started_at: datetime | None
     completed_at: datetime | None
+    error_message: str | None

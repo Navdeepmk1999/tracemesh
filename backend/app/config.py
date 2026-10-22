@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     # Unacked messages a single worker may hold at once.
     worker_prefetch_count: int = 1
 
+    # Redis for live trace Pub/Sub, e.g. rediss://default:<token>@<host>.upstash.io:6379
+    redis_url: str
+
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
 
