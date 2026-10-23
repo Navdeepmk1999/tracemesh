@@ -55,3 +55,9 @@
 **Key architectural decisions:** 
 * Blocked Supabase REST API data leaks by enabling RLS and revoking public schema grants from the `anon` and `authenticated` roles.
 * Standardized workflow creation with database-level 'Untitled Workflow' defaults to simplify the frontend UI layer.
+
+## [Today's Date] PR 9 (Frontend): Auth UI & Dashboard Management
+**What we built:** Implemented secure Next.js authentication flows and workflow CRUD controls.
+**Key architectural decisions:**
+* Integrated Supabase native Auth with email OTP verification and password reset routes.
+* Added dashboard UI controls for renaming and deleting workflows, mapping to the hardened FastAPI endpoints.
