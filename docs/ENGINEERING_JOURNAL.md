@@ -37,3 +37,15 @@
 * Implemented client-side DAG validation rules (no cycles, no self-loops) inside the React Flow `onConnect` handler to prevent bad edge creation before API submission.
 * Rendered the canvas strictly on the client to prevent SSR hydration mismatches with the dark mode theme.
 
+## [Today's Date] PR 7: API & WebSocket Integration
+**What we built:** Wired the React Flow canvas to the FastAPI backend, implementing delta-saves and real-time execution telemetry.
+**Key architectural decisions:** 
+* Decoupled save logic from execution logic, forcing a state sync before dispatching the RabbitMQ task to ensure the worker acts on the exact visual state.
+* Managed client-side UUID generation mapped to server-side UUID generation during partial saves.
+* Handled WebSocket authentication via initial payload message to securely authorize the streaming telemetry session.
+
+## [Today's Date] PR 8: Automated Integration Testing
+**What we built:** Developed a 117-test Pytest suite and a GitHub Actions CI pipeline.
+**Key architectural decisions:** 
+* Tested against a live PostgreSQL container to validate `JSONB` and transactional row locking.
+* Mocked RabbitMQ (`aio_pika`) and Redis (`fakeredis`) to ensure fast, deterministic test execution.
