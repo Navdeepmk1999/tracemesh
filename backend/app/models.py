@@ -21,6 +21,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 
 
+DEFAULT_WORKFLOW_NAME = "Untitled Workflow"
+
+
 class ExecutionStatus(str, enum.Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -44,7 +47,9 @@ class Workflow(Base):
     # Supabase auth user (JWT `sub`) that owns this workflow. Every API query
     # filters on it; nodes and executions inherit ownership through workflow_id.
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=DEFAULT_WORKFLOW_NAME, server_default=DEFAULT_WORKFLOW_NAME
+    )
     description: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

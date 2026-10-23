@@ -1,10 +1,13 @@
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from app.models import ExecutionStatus
+from app.models import DEFAULT_WORKFLOW_NAME, ExecutionStatus
+
+# Trimmed first, so a whitespace-only name is rejected like an empty one.
+WorkflowName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 
 
 class ORMModel(BaseModel):
@@ -15,12 +18,13 @@ class ORMModel(BaseModel):
 
 
 class WorkflowCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
+    name: WorkflowName = DEFAULT_WORKFLOW_NAME
     description: str | None = None
 
 
 class WorkflowUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=255)
+    # Omit to leave unchanged; explicit null is rejected by the API (NOT NULL).
+    name: WorkflowName | None = None
     description: str | None = None
 
 
