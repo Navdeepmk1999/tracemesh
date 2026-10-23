@@ -1,19 +1,33 @@
 import type { Metadata } from "next";
+import Link from "next/link";
+
+import { AuthShell } from "@/components/auth/auth-ui";
 
 import { LoginForm } from "./login-form";
 
 export const metadata: Metadata = { title: "Sign in · TraceMesh" };
 
 export default async function LoginPage({ searchParams }: PageProps<"/login">) {
-  const { next } = await searchParams;
+  const { next, error } = await searchParams;
+  const nextPath = typeof next === "string" ? next : undefined;
 
   return (
-    <div className="flex flex-1 items-center justify-center px-4 py-12">
-      <div className="w-full max-w-sm">
-        <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
-        <p className="mt-1 mb-6 text-sm text-zinc-500">Use your TraceMesh email and password.</p>
-        <LoginForm next={typeof next === "string" ? next : undefined} />
-      </div>
-    </div>
+    <AuthShell
+      title="Sign in"
+      subtitle="Use your TraceMesh email and password."
+      footer={
+        <>
+          New to TraceMesh?{" "}
+          <Link
+            href={nextPath ? `/signup?next=${encodeURIComponent(nextPath)}` : "/signup"}
+            className="font-medium text-violet-700 hover:underline dark:text-violet-400"
+          >
+            Create an account
+          </Link>
+        </>
+      }
+    >
+      <LoginForm next={nextPath} linkError={typeof error === "string" ? error : undefined} />
+    </AuthShell>
   );
 }

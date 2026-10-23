@@ -59,8 +59,11 @@ export function createApiClient(getToken: TokenProvider) {
 
   return {
     listWorkflows: () => request<ApiWorkflow[]>("GET", "/workflows"),
-    createWorkflow: (name: string) => request<ApiWorkflow>("POST", "/workflows", { name }),
+    /** Omit or blank `name` to get the backend default ("Untitled Workflow"). */
+    createWorkflow: (name?: string) => request<ApiWorkflow>("POST", "/workflows", name?.trim() ? { name } : {}),
     getWorkflow: (id: string) => request<ApiWorkflow>("GET", wf(id)),
+    renameWorkflow: (id: string, name: string) => request<ApiWorkflow>("PATCH", wf(id), { name }),
+    deleteWorkflow: (id: string) => request<void>("DELETE", wf(id)),
 
     listNodes: (workflowId: string) => request<ApiNode[]>("GET", `${wf(workflowId)}/nodes?limit=200`),
     createNode: (workflowId: string, node: Pick<ApiNode, "node_type" | "config_json">) =>
