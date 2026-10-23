@@ -49,3 +49,9 @@
 **Key architectural decisions:** 
 * Tested against a live PostgreSQL container to validate `JSONB` and transactional row locking.
 * Mocked RabbitMQ (`aio_pika`) and Redis (`fakeredis`) to ensure fast, deterministic test execution.
+
+## [Today's Date] PR 9 (Backend): Security Audit & RLS Hardening
+**What we built:** Enforced Postgres Row-Level Security (RLS) across all tables and updated schema defaults.
+**Key architectural decisions:** 
+* Blocked Supabase REST API data leaks by enabling RLS and revoking public schema grants from the `anon` and `authenticated` roles.
+* Standardized workflow creation with database-level 'Untitled Workflow' defaults to simplify the frontend UI layer.
