@@ -3,7 +3,10 @@ import { NextResponse, type NextRequest } from "next/server";
 import { safeNextPath } from "@/lib/redirect";
 import { updateSession } from "@/lib/supabase/proxy";
 
-const PROTECTED_PREFIXES = ["/workflows"];
+// /reset-password needs the session that the recovery code or link creates.
+const PROTECTED_PREFIXES = ["/workflows", "/reset-password"];
+// Pointless once signed in; send the user on instead.
+const GUEST_ONLY = new Set(["/login", "/signup", "/verify", "/forgot-password"]);
 
 export async function proxy(request: NextRequest) {
   const { response, userId } = await updateSession(request);
@@ -15,8 +18,8 @@ export async function proxy(request: NextRequest) {
     return redirectWithCookies(loginUrl, response);
   }
 
-  if (userId && pathname === "/login") {
-    const target = safeNextPath(request.nextUrl.searchParams.get("next"));
+  if (userId && GUEST_ONLY.has(pathname)) {
+    const target = safeNextPath(request.nextUrl.searchParams.get("next"), "/workflows");
     return redirectWithCookies(new URL(target, request.url), response);
   }
 

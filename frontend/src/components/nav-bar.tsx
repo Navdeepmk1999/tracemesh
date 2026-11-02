@@ -32,12 +32,17 @@ export async function NavBar() {
             <SignOutButton />
           </>
         ) : (
-          <Link
-            href="/login"
-            className="rounded-md bg-zinc-900 px-3 py-1.5 font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-          >
-            Sign in
-          </Link>
+          <>
+            <Link href="/login" className="rounded-md px-3 py-1.5 font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800">
+              Sign in
+            </Link>
+            <Link
+              href="/signup"
+              className="rounded-md bg-zinc-900 px-3 py-1.5 font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            >
+              Sign up
+            </Link>
+          </>
         )}
       </div>
     </header>
