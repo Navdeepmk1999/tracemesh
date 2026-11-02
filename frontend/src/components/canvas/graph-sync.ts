@@ -1,6 +1,6 @@
 import type { Edge } from "@xyflow/react";
 
-import { createNode, nodeTypes, type WorkflowNode, type WorkflowNodeType } from "@/components/nodes";
+import { createNode, DEFAULT_NODE_LABELS, nodeTypes, type WorkflowNode, type WorkflowNodeType } from "@/components/nodes";
 import type { ApiClient } from "@/lib/api/client";
 import type { ApiEdge, ApiNode } from "@/lib/api/types";
 
@@ -29,8 +29,14 @@ function stableStringify(value: unknown): string {
 }
 
 function nodeConfig(node: WorkflowNode): Record<string, unknown> {
-  // Rounded: sub-pixel drags shouldn't count as unsaved changes.
-  return { ...node.data, position: { x: Math.round(node.position.x), y: Math.round(node.position.y) } };
+  return {
+    ...node.data,
+    // A name cleared on the canvas (e.g. saved with ⌘S mid-edit, before the
+    // input's blur fallback runs) is stored as the type's default, never blank.
+    label: String(node.data.label ?? "").trim() || DEFAULT_NODE_LABELS[node.type],
+    // Rounded: sub-pixel drags shouldn't count as unsaved changes.
+    position: { x: Math.round(node.position.x), y: Math.round(node.position.y) },
+  };
 }
 
 function isPosition(value: unknown): value is { x: number; y: number } {

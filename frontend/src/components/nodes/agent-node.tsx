@@ -3,6 +3,7 @@ import { Bot } from "lucide-react";
 import { memo } from "react";
 
 import { NodeCard } from "./node-card";
+import { DEFAULT_NODE_LABELS } from "./node-label-input";
 import type { AgentFlowNode } from "./types";
 
 /** An LLM agent step: the widest card, with a solid header band. */
@@ -12,6 +13,7 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps<A
       icon={Bot}
       kind="Agent"
       label={data.label}
+      defaultLabel={DEFAULT_NODE_LABELS.agent}
       selected={selected}
       // No overflow-hidden here: handles sit centered on the card edge, and
       // clipping half of each one makes it impossible to grab.

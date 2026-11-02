@@ -3,6 +3,7 @@ import { Zap } from "lucide-react";
 import { memo } from "react";
 
 import { NodeCard } from "./node-card";
+import { DEFAULT_NODE_LABELS } from "./node-label-input";
 import type { TriggerFlowNode } from "./types";
 
 const EVENT_LABELS: Record<TriggerFlowNode["data"]["event"], string> = {
@@ -18,6 +19,7 @@ export const TriggerNode = memo(function TriggerNode({ data, selected }: NodePro
       icon={Zap}
       kind="Trigger"
       label={data.label}
+      defaultLabel={DEFAULT_NODE_LABELS.trigger}
       selected={selected}
       input={false}
       className="w-52 rounded-l-[1.75rem] rounded-r-lg border-emerald-300 ring-emerald-500 dark:border-emerald-800"
