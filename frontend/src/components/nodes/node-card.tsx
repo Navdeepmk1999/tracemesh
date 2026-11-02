@@ -6,6 +6,8 @@ import { useNodeRunState } from "@/components/canvas/run-state";
 import { cn } from "@/lib/cn";
 import type { ExecutionStatus } from "@/lib/api/types";
 
+import { NodeLabelInput } from "./node-label-input";
+
 const RUN_STYLES: Record<ExecutionStatus, string> = {
   PENDING: "opacity-60",
   RUNNING: "ring-2 ring-sky-400 ring-offset-2 ring-offset-white shadow-lg shadow-sky-500/20 dark:ring-offset-zinc-950",
@@ -24,6 +26,8 @@ type NodeCardProps = {
   icon: LucideIcon;
   kind: string;
   label: string;
+  /** Name restored if the user clears the title. */
+  defaultLabel: string;
   selected?: boolean;
   /** Has an input handle (left). Triggers don't: they start a workflow. */
   input?: boolean;
@@ -40,6 +44,7 @@ export function NodeCard({
   icon: Icon,
   kind,
   label,
+  defaultLabel,
   selected,
   input = true,
   output = true,
@@ -79,9 +84,9 @@ export function NodeCard({
 
       <div className={cn("flex items-center gap-2 px-3 py-2", headerClassName)}>
         <Icon className="size-4 shrink-0" aria-hidden />
-        <div className="min-w-0">
+        <div className="min-w-0 flex-1">
           <div className="text-[10px] font-semibold tracking-wider uppercase opacity-75">{kind}</div>
-          <div className="truncate text-sm font-medium">{label}</div>
+          <NodeLabelInput value={label} fallback={defaultLabel} kind={kind} />
         </div>
       </div>
       {children && <div className="px-3 pb-3 text-xs">{children}</div>}

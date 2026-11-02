@@ -5,6 +5,7 @@ import { memo } from "react";
 import { cn } from "@/lib/cn";
 
 import { NodeCard } from "./node-card";
+import { DEFAULT_NODE_LABELS } from "./node-label-input";
 import type { WebhookFlowNode } from "./types";
 
 const METHOD_COLORS: Record<WebhookFlowNode["data"]["method"], string> = {
@@ -22,6 +23,7 @@ export const WebhookNode = memo(function WebhookNode({ data, selected }: NodePro
       icon={Webhook}
       kind="Webhook"
       label={data.label}
+      defaultLabel={DEFAULT_NODE_LABELS.webhook}
       selected={selected}
       className="w-56 rounded-sm border-l-4 border-amber-300 border-l-amber-500 ring-amber-500 dark:border-amber-800 dark:border-l-amber-500"
       headerClassName="text-amber-700 dark:text-amber-300"
