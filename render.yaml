@@ -1,32 +1,23 @@
 services:
   - type: web
-    name: tracemesh-api
-    env: python
+    name: tracemesh-backend
+    runtime: python
     region: ohio
-    buildCommand: "cd backend && pip install -r requirements.txt"
+    buildCommand: "cd backend && pip install -r requirements.txt && alembic upgrade head"
     startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
       - key: DATABASE_URL
         sync: false
       - key: RABBITMQ_URL
         sync: false
       - key: REDIS_URL
+        sync: false
+      - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_JWT_SECRET
         sync: false
       - key: CORS_ORIGINS
-        sync: false
-
-  - type: worker
-    name: tracemesh-worker
-    env: python
-    region: ohio
-    buildCommand: "cd backend && pip install -r requirements.txt"
-    startCommand: "cd backend && python -m app.worker"
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: RABBITMQ_URL
-        sync: false
-      - key: REDIS_URL
         sync: false

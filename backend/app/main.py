@@ -14,16 +14,55 @@ from app.config import get_settings
 from app.database import engine, get_db
 from app.telemetry import close_redis
 from app.websockets import router as ws_router
+from app.worker import consume, log
 
 settings = get_settings()
+
+# Render allows 30s from SIGTERM to SIGKILL; this leaves room for the rest of
+# shutdown. Executions still running after it are redelivered and re-run.
+CONSUMER_DRAIN_SECONDS = 20
+
+
+async def wait_until_started(consumer: asyncio.Task[None], started: asyncio.Event) -> None:
+    """Return once the consumer is registered; raise if it fails first.
+
+    Failing startup beats serving an API that queues executions nobody runs.
+    """
+    waiter = asyncio.create_task(started.wait())
+    try:
+        await asyncio.wait((consumer, waiter), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+    if consumer.done():
+        consumer.result()  # re-raises why it stopped
+        raise RuntimeError("task consumer exited during startup")
+
+
+async def stop_consumer(consumer: asyncio.Task[None], stop: asyncio.Event) -> None:
+    """Let in-flight messages finish, cancelling the consumer past the deadline."""
+    stop.set()
+    if consumer.done():  # it failed to start, and startup already raised why
+        return
+    try:
+        await asyncio.wait_for(consumer, timeout=CONSUMER_DRAIN_SECONDS)
+    except TimeoutError:
+        pass  # wait_for cancelled it; consume() logs the messages it abandoned
+    except Exception as exc:
+        log(f"consumer shutdown failed: {exc!r}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await broker.connect()
+    # Modular monolith: the task consumer shares this process and event loop
+    # with the web server, so one container runs everything.
+    stop, started = asyncio.Event(), asyncio.Event()
+    consumer = asyncio.create_task(consume(stop, started), name="task-consumer")
     try:
+        await wait_until_started(consumer, started)
         yield
     finally:
+        await stop_consumer(consumer, stop)
         await broker.close()
         await close_redis()
         await engine.dispose()
