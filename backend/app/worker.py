@@ -1,6 +1,8 @@
-"""Standalone task consumer.
+"""Task consumer.
 
-Run from backend/:  tracemesh-env/bin/python -m app.worker
+The API runs consume() as a background task in its own process (see
+app.main's lifespan). It can also run standalone, to scale consumers apart
+from the web server. Run from backend/:  tracemesh-env/bin/python -m app.worker
 
 Delivery is at-least-once: a message is acked only after processing finishes,
 so if the worker dies mid-task the broker redelivers it to another consumer.
@@ -262,13 +264,15 @@ async def handle_message(message: AbstractIncomingMessage) -> None:
     await message.ack()
 
 
-async def main() -> None:
-    settings = get_settings()
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+async def consume(stop: asyncio.Event, started: asyncio.Event | None = None) -> None:
+    """Consume tasks until `stop` is set, then let in-flight messages finish.
 
+    Sets `started` once the consumer is registered with the broker. Cancelling
+    instead of setting `stop` abandons in-flight messages unacked: RabbitMQ
+    redelivers them, and the next consumer re-claims their RUNNING executions.
+    Leaves the shared DB engine and Redis client open; the caller owns them.
+    """
+    settings = get_settings()
     in_flight: set[asyncio.Task[None]] = set()
 
     async def on_message(message: AbstractIncomingMessage) -> None:
@@ -281,29 +285,51 @@ async def main() -> None:
         finally:
             in_flight.discard(task)
 
+    # A connection of its own, apart from the API's publisher pool: RabbitMQ
+    # blocks publishing connections under memory or disk alarms, and consuming
+    # on the same connection would stall with them.
     connection = await aio_pika.connect_robust(settings.rabbitmq_url)
-    try:
-        async with connection:
-            channel = await connection.channel()
-            # Without a prefetch limit the broker pushes the whole backlog to the
-            # first worker that connects; this caps it so work spreads evenly.
-            await channel.set_qos(prefetch_count=settings.worker_prefetch_count)
-            queue = await declare_task_queues(channel)
+    async with connection:
+        channel = await connection.channel()
+        # Without a prefetch limit the broker pushes the whole backlog to the
+        # first worker that connects; this caps it so work spreads evenly.
+        await channel.set_qos(prefetch_count=settings.worker_prefetch_count)
+        queue = await declare_task_queues(channel)
 
-            consumer_tag = await queue.consume(on_message)
-            log(f"consuming from {TASK_QUEUE!r} (prefetch={settings.worker_prefetch_count}); Ctrl+C to stop")
+        consumer_tag = await queue.consume(on_message)
+        log(f"consuming from {TASK_QUEUE!r} (prefetch={settings.worker_prefetch_count})")
+        if started is not None:
+            started.set()
 
+        try:
             await stop.wait()
 
             # Stop receiving new messages, then let in-flight ones finish and ack.
             log("shutting down: draining in-flight messages")
             await queue.cancel(consumer_tag)
             if in_flight:
-                await asyncio.gather(*in_flight, return_exceptions=True)
+                # wait(), not gather(): if this task is cancelled mid-drain,
+                # the handlers stay in in_flight for the cleanup below.
+                await asyncio.wait(in_flight)
+        finally:
+            # Non-empty only if the drain was cut short: cancelled, or it raised.
+            if in_flight:
+                log(f"abandoning {len(in_flight)} in-flight message(s); the broker will redeliver them")
+                for task in in_flight:
+                    task.cancel()
+    log("stopped")
+
+
+async def main() -> None:
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+    try:
+        await consume(stop)
     finally:
         await close_redis()
         await engine.dispose()
-    log("stopped")
 
 
 if __name__ == "__main__":

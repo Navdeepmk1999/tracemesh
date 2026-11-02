@@ -9,8 +9,11 @@ webhooks on a visual canvas, run it on a reliable task queue, and watch every no
   self-loops, duplicates and cycles as you draw, and the API enforces the same rules.
 - **Reliable execution:** executions are queued on RabbitMQ with at-least-once delivery and handled
   idempotently, so duplicate deliveries are harmless. Bad messages go to a dead-letter queue, and
-  workers shut down gracefully.
-- **Live run status:** workers record each node's progress in Postgres, then publish it over Redis
+  in-flight runs finish before shutdown.
+- **One-container backend (modular monolith):** the RabbitMQ consumer runs concurrently with the web
+  server, as an asyncio task inside FastAPI's lifespan, so a single free-tier instance runs the
+  whole backend. The worker stays a separate module that can also run as its own process.
+- **Live run status:** the worker records each node's progress in Postgres, then publishes it over Redis
   Pub/Sub. The browser gets a snapshot over an authenticated WebSocket, then the live stream, so
   it's correct even when it joins mid-run.
 - **Accounts:** sign-up with password confirmation and email verification code, sign-in, and
@@ -38,7 +41,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for components, data flows and 
 
 ```
 backend/
-  app/            FastAPI app, worker, broker, telemetry, models
+  app/            FastAPI app, task consumer (worker), broker, telemetry, models
   alembic/        database migrations
   tests/          pytest suite (real Postgres, mocked RabbitMQ and Redis)
 frontend/
@@ -79,20 +82,28 @@ cp .env.example .env.local    # fill in NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC
 - **SMTP:** the built-in mailer only delivers to project team members and is rate-limited. Configure
   custom SMTP before inviting other users.
 
-### 4. Run it (three terminals)
+### 4. Run it (two terminals)
 ```bash
-# API — http://127.0.0.1:8000 (docs at /docs)
+# Backend: API and task consumer in one process — http://127.0.0.1:8000 (docs at /docs)
 cd backend && tracemesh-env/bin/uvicorn app.main:app --reload
-
-# Worker
-cd backend && tracemesh-env/bin/python -m app.worker
 
 # UI — open http://localhost:3000
 cd frontend && npm run dev
 ```
 
+The backend needs only one terminal: FastAPI's lifespan starts the RabbitMQ consumer as a
+background asyncio task, so the API process also runs executions. Running the consumer
+separately is optional, for example to test with several consumers:
+`cd backend && tracemesh-env/bin/python -m app.worker`. Extra consumers share the queue safely.
+
 Open the app at `http://localhost:3000`, not `127.0.0.1:3000`: the API's `CORS_ORIGINS` allows
 `http://localhost:3000` by default. The API won't start if it can't reach RabbitMQ.
+
+### Deployment
+`render.yaml` deploys the backend to Render as a single web service, which fits the free tier
+(Render's free tier has no background workers). The build step installs dependencies and runs
+`alembic upgrade head`, because Render's pre-deploy commands are only available on paid plans.
+Set the secret environment variables listed there in the Render dashboard.
 
 ### Tests
 The backend suite needs a disposable local Postgres. RabbitMQ and Redis are mocked:

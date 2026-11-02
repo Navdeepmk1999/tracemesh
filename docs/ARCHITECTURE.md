@@ -1,10 +1,14 @@
 # TraceMesh Architecture
 
 TraceMesh is a multi-tenant workflow orchestrator. Users build a DAG of nodes on a canvas, then
-execute it. A worker runs the nodes in dependency order, and the UI shows each node's progress
-live.
+execute it. A task consumer runs the nodes in dependency order, and the UI shows each node's
+progress live.
 
-This document describes the system as implemented (through PR 9).
+The backend is a **modular monolith**: the RabbitMQ consumer runs concurrently with the web server,
+as an asyncio task inside the FastAPI process, so the whole backend deploys as one container. See
+[Process model](#process-model).
+
+This document describes the system as implemented (through PR 12).
 
 ## Stack
 
@@ -23,12 +27,17 @@ This document describes the system as implemented (through PR 9).
 ```
 Browser ──(Supabase JS: sign-up, OTP, login, reset)──────────────► Supabase Auth
    │  session cookies (@supabase/ssr), refreshed by src/proxy.ts
-   ├── REST, Authorization: Bearer <access token> ──► FastAPI ──► Postgres
-   └── WebSocket /ws/executions/{id} ───────────────► FastAPI ◄── Redis Pub/Sub ◄── Worker
-                                                         │                            ▲
+   ├── REST, Authorization: Bearer <access token> ──► FastAPI ──► Postgres ◄── consumer task
+   └── WebSocket /ws/executions/{id} ───────────────► FastAPI ◄── Redis Pub/Sub ◄┘       ▲
+                                                         │                               │
                                                          └──► RabbitMQ (tracemesh_tasks) ┘
                                                                   └─ DLX ─► tracemesh_tasks.dead
+
+FastAPI and the consumer task share one process and one container (see Process model).
 ```
+
+The consumer reaches the other components only through RabbitMQ, Postgres and Redis, never by
+calling into the API code, so it can move back into its own process unchanged.
 
 ### Next.js app (`frontend/`)
 - **Routing and session:** `src/proxy.ts` (Next 16's replacement for `middleware.ts`) runs on every
@@ -55,7 +64,7 @@ Browser ──(Supabase JS: sign-up, OTP, login, reset)────────�
 ### FastAPI service (`backend/app/`)
 | Module | Responsibility |
 |---|---|
-| `main.py` | App, CORS, lifespan (connects to RabbitMQ on startup, so an unreachable broker fails startup; closes RabbitMQ, Redis and the DB engine on shutdown), health endpoints |
+| `main.py` | App, CORS, health endpoints, and the lifespan: connects the RabbitMQ publisher and starts the task consumer on startup (either failing fails startup); on shutdown drains the consumer, then closes RabbitMQ, Redis and the DB engine |
 | `auth.py` | `get_current_user`: verifies the Supabase JWT, returns `user_id` |
 | `api.py` | Tenant-scoped REST: workflows, nodes, edges, executions |
 | `dag.py` | Topological order, cycle detection, execution payload |
@@ -65,10 +74,37 @@ Browser ──(Supabase JS: sign-up, OTP, login, reset)────────�
 | `database.py` | Async engine and sessions, set up for Supavisor transaction mode |
 | `models.py` / `pydantic_schemas.py` | ORM models and request/response schemas |
 
-### Worker (`backend/app/worker.py`, run as `python -m app.worker`)
-A standalone process that consumes `tracemesh_tasks`, runs executions, records progress in
-Postgres and publishes trace events. Node execution is currently simulated: one second per node,
-and `config_json.simulate_failure` makes a node raise. Nodes run sequentially in topological order.
+### Task consumer (`backend/app/worker.py`)
+Consumes `tracemesh_tasks`, runs executions, records progress in Postgres and publishes trace
+events. Node execution is currently simulated: one second per node, and
+`config_json.simulate_failure` makes a node raise. Nodes run sequentially in topological order.
+
+### Process model
+**Why one process:** Render's free tier offers web services but no background workers. Running the
+consumer inside the API process means the whole backend fits in one free container, and locally
+the backend needs one terminal instead of two.
+
+**How it runs:**
+1. **Startup:** the FastAPI lifespan starts `worker.consume()` with `asyncio.create_task()`, on the
+   same event loop as uvicorn. The app reports ready only once the consumer is registered with
+   RabbitMQ. If the consumer can't start, startup fails, rather than serving an API that queues
+   executions nobody runs.
+2. **Running:** web requests and executions interleave on one event loop. This works because node
+   work is async I/O.
+3. **Shutdown:** on SIGTERM the lifespan signals the consumer to stop. It cancels its subscription
+   so no new messages arrive, then gives in-flight executions up to 20 seconds
+   (`CONSUMER_DRAIN_SECONDS`, inside Render's 30-second shutdown window) to finish and ack.
+4. **Past the deadline:** the consumer task is cancelled. Its unfinished messages are never acked,
+   so RabbitMQ redelivers them, and the next consumer re-claims the `RUNNING` executions and runs
+   them from the start.
+
+**What stays separate:**
+- The consumer opens its own AMQP connection rather than using the API's publisher pool.
+  RabbitMQ blocks publishing connections during memory or disk alarms, and a consumer on the same
+  connection would stall too.
+- `python -m app.worker` still runs the same `consume()` as a standalone process, with its own
+  SIGTERM/SIGINT handling. Running extra consumers this way, alongside the API's built-in one,
+  scales execution independently of the web tier. They share the queue as competing consumers.
 
 ## Data model
 
@@ -152,7 +188,7 @@ cycles. The database's composite foreign keys enforce the same-workflow rule ind
    `mandatory`/`on_return_raises`. The payload is `{execution_id, workflow_id, user_id, nodes,
    edges, order}`. If the publish fails, the execution is marked `FAILED` and the API returns 503.
 
-### 4. Running (worker)
+### 4. Running (task consumer)
 1. **Consume** with `prefetch_count` (default 1) and manual acks.
 2. **Claim** with a single conditional UPDATE: `PENDING`/`RUNNING` → `RUNNING`, resetting that run's
    `node_runs` to `PENDING` in the same transaction. If no row is claimed, the run is already
@@ -175,7 +211,8 @@ Error handling:
 | Infrastructure failure (e.g. the database) | `nack`, requeued once (when `redelivered` is false), then dead-lettered |
 | Trace publishing | Best-effort, 2s timeout, failures logged and dropped |
 
-On SIGTERM/SIGINT the worker stops consuming, finishes and acks in-flight messages, then exits.
+On shutdown the consumer stops taking messages, then finishes and acks in-flight ones, within the
+deadline described in [Process model](#process-model).
 
 ### 5. Live telemetry (WebSocket)
 1. The client opens `/ws/executions/{id}` and sends `{"type": "auth", "token": "<jwt>"}` within 10s.
@@ -249,7 +286,7 @@ Every event has `execution_id`, `timestamp`, `event` and `seq` (per execution at
 | `DATABASE_URL` | `postgresql+asyncpg://…` Supavisor transaction-mode URL (port 6543) |
 | `MIGRATION_DATABASE_URL` | Optional direct/session URL for Alembic |
 | `SUPABASE_JWT_SECRET` / `SUPABASE_URL` | HS256 secret / project URL (enables JWKS verification and the issuer check) |
-| `RABBITMQ_URL`, `WORKER_PREFETCH_COUNT` | Broker URL, unacked messages per worker (default 1) |
+| `RABBITMQ_URL`, `WORKER_PREFETCH_COUNT` | Broker URL, unacked messages per consumer (default 1, so one execution at a time per process) |
 | `REDIS_URL` | `rediss://…` for Upstash |
 | `CORS_ORIGINS` | JSON list of allowed browser origins |
 
@@ -259,16 +296,22 @@ Every event has `execution_id`, `timestamp`, `event` and `seq` (per execution at
 | `NEXT_PUBLIC_API_URL` | FastAPI base URL (default `http://127.0.0.1:8000`) |
 | `NEXT_PUBLIC_WS_URL` | Optional; defaults to the API URL with `http(s)` → `ws(s)` |
 
+**Deployment:** `render.yaml` defines one Render web service, `tracemesh-backend`, running uvicorn
+with the built-in consumer. Its health check is `/health`. The build command also runs
+`alembic upgrade head`, because Render's pre-deploy commands are only available on paid plans.
+
 **Database connections:** the engine uses `NullPool`, because Supavisor does the pooling. It also
 disables asyncpg's prepared-statement cache and gives each statement a unique name, because in
 transaction mode consecutive statements can run on different Postgres backends.
 
 ## Testing
 
-`backend/tests/` has 126 tests and runs in about 6 seconds:
+`backend/tests/` has 130 tests and runs in about 6 seconds:
 - **Real PostgreSQL,** because the constraints, JSONB, enums and conditional UPDATEs are part of what's
   under test. The schema is built by running the migrations down to base and back up.
 - **Mocked RabbitMQ** (a publish recorder and fake aio-pika channels) and **fakeredis** for Redis.
+  Lifespan tests drive the in-process consumer through startup, drain, deadline cancellation and
+  startup failure.
 - **A safety guard** refuses to run against any database that isn't local or whose name doesn't
   contain `test`.
 - **CI:** `.github/workflows/backend-tests.yml` runs on pushes to `main` and on PRs that touch
@@ -292,3 +335,8 @@ The frontend has no automated tests in CI yet.
 - **User deletion:** `workflows.user_id` has no foreign key to `auth.users`, so deleting a user
   doesn't remove their workflows.
 - **Simulated nodes:** node execution is simulated.
+- **Shared event loop:** the API and the consumer share one event loop, so a node that blocks it
+  (CPU-heavy or synchronous I/O code) would also stall API requests and WebSockets. Such work
+  belongs in a thread or a standalone worker.
+- **Long runs on deploy:** executions still running 20 seconds into a shutdown are re-run from the
+  start on the next instance.
