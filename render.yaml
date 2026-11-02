@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: tracemesh-api
+    env: python
+    region: ohio
+    buildCommand: "cd backend && pip install -r requirements.txt"
+    startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: RABBITMQ_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+
+  - type: worker
+    name: tracemesh-worker
+    env: python
+    region: ohio
+    buildCommand: "cd backend && pip install -r requirements.txt"
+    startCommand: "cd backend && python -m app.worker"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: RABBITMQ_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
