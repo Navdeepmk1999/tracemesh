@@ -61,3 +61,22 @@
 **Key architectural decisions:**
 * Integrated Supabase native Auth with email OTP verification and password reset routes.
 * Added dashboard UI controls for renaming and deleting workflows, mapping to the hardened FastAPI endpoints.
+
+## PR 10: Inline Node Renaming
+**What we built:** Made each node's title on the React Flow canvas an editable text field.
+**Key architectural decisions:**
+* Wrote edits straight into the node's `data.label` through `useReactFlow().setNodes`, so renames ride the existing delta save with no new API surface.
+* Marked the input `nodrag nopan` so selecting text doesn't drag the node or zoom the canvas, and fell back to a per-type default name when a title is left blank.
+
+## PR 11: Infrastructure as Code
+**What we built:** Added a `render.yaml` Blueprint describing the Render deployment.
+**Key architectural decision:** Kept deployment configuration in version control, with secrets declared as `sync: false` so their values live only in the Render dashboard.
+
+## PR 12: Modular Monolith
+**What we built:** Merged the RabbitMQ worker into the FastAPI process, so the whole backend runs in one container, and one terminal locally.
+**Key architectural decisions:**
+* Started the consumer with `asyncio.create_task()` inside the FastAPI lifespan, sharing uvicorn's event loop. Render's free tier has no background workers, so this saves the cost of a second paid service.
+* Made startup wait until the consumer is registered with RabbitMQ, failing the deploy otherwise, so the API never accepts executions that nothing will run.
+* Drained in-flight executions for up to 20 seconds on SIGTERM (inside Render's 30-second window), then cancelled the rest unacked so RabbitMQ redelivers them and the idempotent claim re-runs them.
+* Kept the consumer on its own AMQP connection, separate from the publisher pool, and kept `python -m app.worker` working, so the consumer can be split back out without code changes.
+* Moved `alembic upgrade head` into the build command, because Render's pre-deploy commands are paid-only.
