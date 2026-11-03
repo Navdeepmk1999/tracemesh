@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -17,6 +18,8 @@ from app.websockets import router as ws_router
 from app.worker import consume, log
 
 settings = get_settings()
+# uvicorn configures this logger, so its messages reach the Render log stream.
+logger = logging.getLogger("uvicorn.error")
 
 # Render allows 30s from SIGTERM to SIGKILL; this leaves room for the rest of
 # shutdown. Executions still running after it are redelivered and re-run.
@@ -53,6 +56,9 @@ async def stop_consumer(consumer: asyncio.Task[None], stop: asyncio.Event) -> No
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # A preflight from any other origin gets 400 "Disallowed CORS origin"; the
+    # log shows what the deployed env var actually parsed to.
+    logger.info("CORS allowed origins: %s", settings.cors_origins)
     await broker.connect()
     # Modular monolith: the task consumer shares this process and event loop
     # with the web server, so one container runs everything.
@@ -73,6 +79,8 @@ app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
+    # The frontend authenticates with an Authorization: Bearer header, which
+    # makes every API call a preflighted request; "*" allows that header.
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
