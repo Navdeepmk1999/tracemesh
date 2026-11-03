@@ -8,7 +8,7 @@ The backend is a **modular monolith**: the RabbitMQ consumer runs concurrently w
 as an asyncio task inside the FastAPI process, so the whole backend deploys as one container. See
 [Process model](#process-model).
 
-This document describes the system as implemented (through PR 12).
+This document describes the system as implemented (through PR 14).
 
 ## Stack
 
@@ -75,9 +75,22 @@ calling into the API code, so it can move back into its own process unchanged.
 | `models.py` / `pydantic_schemas.py` | ORM models and request/response schemas |
 
 ### Task consumer (`backend/app/worker.py`)
-Consumes `tracemesh_tasks`, runs executions, records progress in Postgres and publishes trace
-events. Node execution is currently simulated: one second per node, and
-`config_json.simulate_failure` makes a node raise. Nodes run sequentially in topological order.
+Consumes `tracemesh_tasks`, runs executions, records each node's progress in Postgres and
+publishes trace events. It runs as a background task inside the API process (see
+[Process model](#process-model)), or standalone as `python -m app.worker`.
+
+The orchestration layer is complete: DAG validation, durable queueing, idempotent claiming,
+per-node state, failure capture and live streaming are all real and tested. Node *execution* is
+behind a single executor seam, `run_node(node)`:
+- **Today:** it simulates work, taking one second per node; `config_json.simulate_failure` makes a
+  node raise, so failure paths can be exercised end to end.
+- **Designed for real executors:** an `agent` node calls an LLM, and a `webhook` node makes an
+  outbound HTTP request. The orchestration layer needs no changes to adopt them: whatever
+  `run_node` raises is recorded as the node's `error_message`, fails the execution and is streamed
+  as `node.failed`.
+
+Nodes run sequentially in topological order, so a node never starts before its dependencies
+finish.
 
 ### Process model
 **Why one process:** Render's free tier offers web services but no background workers. Running the
@@ -288,7 +301,7 @@ Every event has `execution_id`, `timestamp`, `event` and `seq` (per execution at
 | `SUPABASE_JWT_SECRET` / `SUPABASE_URL` | HS256 secret / project URL (enables JWKS verification and the issuer check) |
 | `RABBITMQ_URL`, `WORKER_PREFETCH_COUNT` | Broker URL, unacked messages per consumer (default 1, so one execution at a time per process) |
 | `REDIS_URL` | `rediss://…` for Upstash |
-| `CORS_ORIGINS` | JSON list of allowed browser origins |
+| `CORS_ORIGINS` | Allowed browser origins: comma-separated or a JSON list. Entries are trimmed and trailing slashes removed; the parsed list is logged at startup |
 
 | Frontend (`frontend/.env.local`) | |
 |---|---|
@@ -306,7 +319,7 @@ transaction mode consecutive statements can run on different Postgres backends.
 
 ## Testing
 
-`backend/tests/` has 130 tests and runs in about 6 seconds:
+`backend/tests/` has 140 tests and runs in about 7 seconds:
 - **Real PostgreSQL,** because the constraints, JSONB, enums and conditional UPDATEs are part of what's
   under test. The schema is built by running the migrations down to base and back up.
 - **Mocked RabbitMQ** (a publish recorder and fake aio-pika channels) and **fakeredis** for Redis.
@@ -331,10 +344,18 @@ The frontend has no automated tests in CI yet.
 - **Redis connections:** each WebSocket holds its own Redis Pub/Sub connection.
 - **Saves aren't atomic:** a save is several REST calls, not one transaction.
 - **Graph size:** the canvas loads at most 200 nodes and 200 edges.
-- **Sequential runs:** nodes run one after another; independent branches don't run in parallel.
+- **Simulated executors:** `agent` and `webhook` nodes don't yet call an LLM or an external endpoint.
+  Real executors will need per-node timeouts, retries with backoff, and idempotency keys on
+  outbound webhooks, since at-least-once delivery can re-run a node.
+- **Execution bounds:**
+  - **No parallel branches:** nodes run one at a time in topological order. A fan-out (Y-branch)
+    runs its branches one after another, so a run takes as long as all its nodes combined, not
+    just its slowest path. Parallel execution is on the roadmap: either
+    `asyncio.gather` over each ready set, or one message per node.
+  - **One run at a time per process:** with `prefetch=1`, each consumer process runs one execution
+    at a time. Raise `WORKER_PREFETCH_COUNT` or add standalone consumers to scale.
 - **User deletion:** `workflows.user_id` has no foreign key to `auth.users`, so deleting a user
   doesn't remove their workflows.
-- **Simulated nodes:** node execution is simulated.
 - **Shared event loop:** the API and the consumer share one event loop, so a node that blocks it
   (CPU-heavy or synchronous I/O code) would also stall API requests and WebSockets. Such work
   belongs in a thread or a standalone worker.
