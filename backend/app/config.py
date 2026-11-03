@@ -1,8 +1,10 @@
+import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated, Any
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -40,7 +42,27 @@ class Settings(BaseSettings):
     # Redis for live trace Pub/Sub, e.g. rediss://default:<token>@<host>.upstash.io:6379
     redis_url: str
 
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    # Browser origins allowed by CORS: a JSON list (["https://app.example.com"]) or
+    # comma-separated. Browsers send the origin as scheme://host[:port] with no
+    # path, so entries must match that exactly; see _parse_origins.
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:3000"])
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _parse_origins(cls, value: Any) -> Any:
+        """Accept a JSON list or comma-separated origins, normalised.
+
+        A trailing slash or stray whitespace (easy to paste into a dashboard)
+        would otherwise never match the browser's Origin header, and every
+        preflight would fail with 400 "Disallowed CORS origin".
+        """
+        if isinstance(value, str):
+            text = value.strip()
+            value = json.loads(text) if text.startswith("[") else text.split(",")
+        if isinstance(value, list):
+            value = [o.strip().rstrip("/") if isinstance(o, str) else o for o in value]
+            value = [o for o in value if o != ""]
+        return value
 
 
 @lru_cache
