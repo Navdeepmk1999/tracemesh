@@ -7,7 +7,7 @@
 **Key architectural decisions:** 
 * Implemented a connection pool and channel multiplexing to prevent socket exhaustion.
 * Configured a Dead-Letter Queue (`tracemesh_tasks.dead`) to capture malformed payloads without crashing the worker loop.
-* Implemented graceful shutdown (handling `SIGINT`/`SIGTERM`) so the worker finishes active tasks before terminating, ensuring zero data loss during deployments.
+* Implemented graceful shutdown (handling `SIGINT`/`SIGTERM`) so the worker finishes active tasks before terminating, ensuring no lost work during deployments: a message is acknowledged only after its run finishes, so any run interrupted mid-flight is redelivered by RabbitMQ and re-run from the start.
 
 ## PR 3: Multi-Tenancy & Execution Engine
 **What we built:** Enforced strict multi-tenancy using Supabase JWT authentication and wired the FastAPI DAG validation to the asynchronous RabbitMQ worker.
@@ -51,9 +51,10 @@
 * Mocked RabbitMQ (`aio_pika`) and Redis (`fakeredis`) to ensure fast, deterministic test execution.
 
 ## PR 9 (Backend): Security Audit & RLS Hardening
-**What we built:** Enforced Postgres Row-Level Security (RLS) across all tables and updated schema defaults.
+**What we built:** Enabled Postgres Row-Level Security (RLS) on all tables to lock down the public Supabase REST API, and updated schema defaults.
 **Key architectural decisions:** 
 * Blocked Supabase REST API data leaks by enabling RLS and revoking public schema grants from the `anon` and `authenticated` roles.
+* Kept tenant isolation in the application layer: the FastAPI backend connects as the table owner, which bypasses RLS, so every query is scoped to the authenticated `user_id` from the verified JWT.
 * Standardized workflow creation with database-level 'Untitled Workflow' defaults to simplify the frontend UI layer.
 
 ## PR 9 (Frontend): Auth UI & Dashboard Management
@@ -80,3 +81,16 @@
 * Drained in-flight executions for up to 20 seconds on SIGTERM (inside Render's 30-second window), then cancelled the rest unacked so RabbitMQ redelivers them and the idempotent claim re-runs them.
 * Kept the consumer on its own AMQP connection, separate from the publisher pool, and kept `python -m app.worker` working, so the consumer can be split back out without code changes.
 * Moved `alembic upgrade head` into the build command, because Render's pre-deploy commands are paid-only.
+
+## PR 13: Tolerant CORS Parsing & Startup Diagnostics
+**What we built:** Hardened the `CORS_ORIGINS` parsing in the settings layer that feeds FastAPI's `CORSMiddleware`, and expanded the Pytest suite to 140 tests.
+**Key architectural decisions:**
+* Replaced strict JSON-only parsing with tolerant parsing (accepting comma-separated strings or JSON lists, and stripping whitespace and trailing slashes). Starlette still matches each browser origin exactly, so normalising at config load prevents silent `400 Disallowed CORS origin` preflight failures caused by malformed cloud environment variables.
+* Implemented explicit startup logging (`CORS allowed origins: [...]`) so the parsed configuration is immediately verifiable in the Render deployment logs.
+
+## PR 14: Documentation & Execution Boundaries
+**What we built:** Documented the system's target AI/ML use case (Automated Codebase Onboarding & RAG Pipeline) and established strict execution boundaries in the architecture documentation.
+**Key architectural decisions:**
+* Designed the target DAG workflow mapping trigger, agent, and webhook nodes to real-world operations (AST parsing, Claude Sonnet summarization, pgvector upserting).
+* Maintained strict engineering honesty for technical interviews by explicitly documenting the boundary between the *completed orchestration engine* (queueing, state management, WebSockets) and the *simulated execution layer*.
+* Logged true parallel branch execution (Y-branches) and external LLM/HTTP calls as explicit roadmap constraints rather than overclaiming current capabilities.

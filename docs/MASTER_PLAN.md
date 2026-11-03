@@ -20,32 +20,22 @@ canvas, run them on a reliable task queue, and watch each node execute live.
 | 10 | Canvas node renaming | Inline-editable node titles on the canvas, saved through the existing delta sync; blank names fall back to a per-type default |
 | 11 | Infrastructure as code | `render.yaml` Blueprint for Render deployment |
 | 12 | Modular monolith | The RabbitMQ consumer runs as a background `asyncio` task inside the FastAPI lifespan, so the API and worker share one process and one free-tier container. Startup waits for the consumer; shutdown drains in-flight runs for up to 20s, and anything left is redelivered. `python -m app.worker` can still run extra consumers. `render.yaml` reduced to one web service, with migrations in the build step |
+| 13 | Configuration & Diagnostics | Tolerant `CORS_ORIGINS` parsing (comma-separated or JSON list with whitespace/slash stripping); startup logging of parsed origins to diagnose cloud environment variable issues; expanded Pytest suite to 140 tests |
+| 14 | Documentation | Aligned architecture and engineering journal with strict execution boundaries; documented the simulated execution layer vs. the completed orchestration engine; mapped out the target AI/ML Automated Codebase Onboarding & RAG Pipeline |
 
-Current state: 130 backend tests passing in CI; frontend typechecks, lints and builds. Locally the
-backend runs in one terminal (`uvicorn app.main:app`), which also executes workflows.
+Current state: 140 backend tests passing in CI; frontend typechecks, lints and builds. The
+application is deployed and live on Render (backend) and Vercel (frontend). Locally the backend
+runs in one terminal (`uvicorn app.main:app`), which also executes workflows.
 
 ## Upcoming
 
-### Next — Go live
-- **Backend on Render:** one web service, `tracemesh-backend`, from `render.yaml`. It runs
-  `uvicorn app.main:app` from `backend/`, and the task consumer runs inside it, so no background
-  worker service is needed. That fits Render's free tier.
-- **Migrations:** `alembic upgrade head` runs in the build command, since Render's pre-deploy
-  commands are paid-only. Set `MIGRATION_DATABASE_URL` to the session-mode URL if DDL needs it.
-- **Frontend on Vercel** (`frontend/`).
-- **Production environment variables:**
-  - `CORS_ORIGINS` set to the Vercel domain (a JSON list);
-  - `NEXT_PUBLIC_API_URL` / `NEXT_PUBLIC_WS_URL` set to the Render URL (`https`/`wss`);
-  - Supabase, RabbitMQ and Redis credentials stored as platform secrets.
-- **Supabase Auth for production:**
-  - custom SMTP (the built-in mailer only reaches project team members and is heavily rate-limited);
-  - email templates for sign-up and recovery that include `{{ .Token }}`;
-  - Site URL and Redirect URLs that include `https://<domain>/auth/confirm`.
-- **Health checks:** Render probes `/health`; `/health/db` and `/health/broker` remain available
-  for readiness.
-- **Free-tier behaviour:** the instance sleeps after inactivity. Executions are only queued through
-  the API, which wakes it, so no queued work waits on a sleeping consumer.
-- **Custom domains** and TLS.
+### Next — Real AI/ML Executors & Parallelism
+- Real node executors (LLM calls, outbound webhooks) with per-node idempotency keys. Agent nodes
+  call Claude Sonnet 5.5 through the async Anthropic SDK (`AsyncAnthropic`), and webhook nodes use
+  a shared `httpx.AsyncClient`, both with timeouts, so slow I/O is awaited and never blocks the
+  FastAPI event loop that the consumer shares with the API.
+- Parallel execution of independent branches (per-node messages), so a Y-branch's webhooks run
+  concurrently instead of one at a time in topological order.
 
 ### Then — Production hardening
 - Rate limiting on the API (Upstash Redis token bucket), especially `/execute` and edge writes.
@@ -59,8 +49,6 @@ backend runs in one terminal (`uvicorn app.main:app`), which also executes workf
 
 ### Later
 - Per-user Postgres RLS policies so the database also enforces tenancy for the API's own queries.
-- Real node executors (LLM calls, outbound webhooks) with per-node idempotency keys.
-- Parallel execution of independent branches (per-node messages).
 - A shared Redis subscriber per API process; Redis Streams for replayable traces.
 - A transactional bulk graph-save endpoint.
 - Foreign key from `workflows.user_id` to `auth.users` with cascade on user deletion.
